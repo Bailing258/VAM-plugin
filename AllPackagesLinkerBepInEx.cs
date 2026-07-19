@@ -16,9 +16,9 @@ using ICSharpCode.SharpZipLib.Zip;
 using MVR.FileManagement;
 using Valve.VR;
 
-[BepInPlugin("local.vam.allpackageslinker", "AllPackagesLinker", "1.2.6")]
+[BepInPlugin("local.vam.allpackageslinker", "AllPackagesLinker", "1.2.7")]
 public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
-    private const string PluginVersion = "1.2.6";
+    private const string PluginVersion = "1.2.7";
     private const string LinkRootName = "_AllPackagesLinkerLinks";
     private const string CacheHeader = "#APL_INDEX_V2";
     private const string ListSep = "\u001f";
@@ -144,6 +144,7 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
     private float uiDistance = 1.20f;
     private float uiYOffset = -0.04f;
     private bool autoOpenPanelInEditMode = false;
+    private bool autoOpenPanelOnPluginLoad = false;
     private bool autoAllowAllPlugins = false;
     private bool scanAllPackagesOnStartup = false;
     private bool autoCleanLinksBeforeSceneLoad = false;
@@ -171,22 +172,24 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
     // cannot close/open again during a single physical gesture.
     private bool vrComboLatched = false;
 
-    // Frosted glass light theme
-    private static readonly Color colBg = new Color(0.92f, 0.94f, 0.97f, 0.92f);
-    private static readonly Color colPanel = new Color(0.96f, 0.97f, 0.99f, 0.88f);
-    private static readonly Color colCard = new Color(1.00f, 1.00f, 1.00f, 0.85f);
-    private static readonly Color colCardHover = new Color(0.93f, 0.95f, 1.00f, 0.92f);
-    private static readonly Color colCardSelected = new Color(0.78f, 0.88f, 1.00f, 0.95f);
-    private static readonly Color colAccent = new Color(0.25f, 0.52f, 0.96f, 1f);
-    private static readonly Color colAccentDim = new Color(0.35f, 0.58f, 0.92f, 0.90f);
-    private static readonly Color colBtn = new Color(0.88f, 0.91f, 0.96f, 0.92f);
-    private static readonly Color colBtnHover = new Color(0.80f, 0.85f, 0.95f, 1f);
-    private static readonly Color colTextPrimary = new Color(0.12f, 0.13f, 0.16f, 1f);
-    private static readonly Color colTextSecondary = new Color(0.35f, 0.38f, 0.45f, 1f);
-    private static readonly Color colTextDim = new Color(0.55f, 0.58f, 0.64f, 1f);
-    private static readonly Color colDivider = new Color(0.80f, 0.82f, 0.86f, 0.60f);
-    private static readonly Color colScrollBg = new Color(0.94f, 0.95f, 0.97f, 0.90f);
-    private static readonly Color colThumbBg = new Color(0.90f, 0.92f, 0.95f, 0.85f);
+    // Clean high-contrast dark theme (desktop + VR readable)
+    private static readonly Color colBg = new Color(0.14f, 0.16f, 0.20f, 0.96f);
+    private static readonly Color colPanel = new Color(0.18f, 0.20f, 0.26f, 0.96f);
+    private static readonly Color colCard = new Color(0.22f, 0.24f, 0.30f, 0.96f);
+    private static readonly Color colCardHover = new Color(0.28f, 0.32f, 0.40f, 0.98f);
+    private static readonly Color colCardSelected = new Color(0.22f, 0.38f, 0.62f, 0.98f);
+    private static readonly Color colAccent = new Color(0.30f, 0.62f, 1.00f, 1f);
+    private static readonly Color colAccentDim = new Color(0.24f, 0.48f, 0.86f, 0.95f);
+    private static readonly Color colBtn = new Color(0.28f, 0.32f, 0.40f, 0.98f);
+    private static readonly Color colBtnHover = new Color(0.34f, 0.40f, 0.50f, 1f);
+    private static readonly Color colTextPrimary = new Color(0.96f, 0.97f, 0.99f, 1f);
+    private static readonly Color colTextSecondary = new Color(0.78f, 0.82f, 0.88f, 1f);
+    private static readonly Color colTextDim = new Color(0.58f, 0.62f, 0.70f, 1f);
+    private static readonly Color colDivider = new Color(0.35f, 0.38f, 0.46f, 0.70f);
+    private static readonly Color colScrollBg = new Color(0.12f, 0.14f, 0.18f, 0.96f);
+    private static readonly Color colThumbBg = new Color(0.16f, 0.18f, 0.22f, 0.95f);
+    private static readonly Color colDanger = new Color(0.82f, 0.28f, 0.28f, 0.95f);
+    private static readonly Color colSuccess = new Color(0.20f, 0.62f, 0.40f, 0.95f);
 
     private void Awake() {
         try {
@@ -237,7 +240,8 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
                 SetStatus("已加载缓存：" + cached + " 个包，" + localPresets.Count + " 个本地预设。已跳过启动全库扫描，需要更新库时点“重新扫描”。", true);
                 DebugLog("Startup full scan skipped by config.");
             }
-            Invoke("TryAutoOpenPanelInEditMode", 1.3f);
+            Invoke("TryAutoOpenPanelOnPluginLoad", 2.0f);
+            Invoke("TryAutoOpenPanelInEditMode", 2.5f);
             DebugLog("Awake end. Delayed startup scan scheduled.");
         } catch(Exception e) {
             DebugLog("Awake FAILED: " + e.ToString());
@@ -522,14 +526,32 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         catch(Exception e) { DebugLog("TogglePanel FAILED: " + e.ToString()); Logger.LogError(e); SetStatus("菜单呼出失败：" + e.Message, true); }
         DebugLog("TogglePanel end. canvasExists=" + (canvas != null));
     }
+    private void TryAutoOpenPanelOnPluginLoad() {
+        try {
+            if (!autoOpenPanelOnPluginLoad) return;
+            if (canvas != null) return;
+            if (SuperController.singleton == null) {
+                Invoke("TryAutoOpenPanelOnPluginLoad", 1.0f);
+                return;
+            }
+            // Prefer desktop overlay for auto-open reliability; VR users can use gesture.
+            openedViaVR = false;
+            DebugLog("Auto opening panel after plugin load.");
+            OpenPanel();
+        } catch(Exception e) {
+            DebugLog("TryAutoOpenPanelOnPluginLoad FAILED: " + e.ToString());
+        }
+    }
     private void TryAutoOpenPanelInEditMode() {
         try {
+            if (autoOpenPanelOnPluginLoad) return; // already covered by plugin-load open
             if (!autoOpenPanelInEditMode) return;
             if (canvas != null) return;
             if (isVRMode) return;
             if (SuperController.singleton == null) return;
             if ((int)SuperController.singleton.gameMode != 0) return;
             DebugLog("Auto opening panel in Edit mode.");
+            openedViaVR = false;
             OpenPanel();
         } catch(Exception e) {
             DebugLog("TryAutoOpenPanelInEditMode FAILED: " + e.ToString());
@@ -1400,6 +1422,7 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
                 if(k=="page" && int.TryParse(v,out iv)) page=Mathf.Max(0, iv);
                 if(k.StartsWith("tabPage:", StringComparison.OrdinalIgnoreCase) && int.TryParse(v,out iv)) tabPages[k.Substring(8)] = Mathf.Max(0, iv);
                 if(k=="autoOpenPanelInEditMode") autoOpenPanelInEditMode=(v=="1" || v.Equals("true", StringComparison.OrdinalIgnoreCase));
+                if(k=="autoOpenPanelOnPluginLoad") autoOpenPanelOnPluginLoad=(v=="1" || v.Equals("true", StringComparison.OrdinalIgnoreCase));
                 if(k=="autoAllowAllPlugins") autoAllowAllPlugins=(v=="1" || v.Equals("true", StringComparison.OrdinalIgnoreCase));
                 if(k=="scanAllPackagesOnStartup") scanAllPackagesOnStartup=(v=="1" || v.Equals("true", StringComparison.OrdinalIgnoreCase));
                 if(k=="autoCleanLinksBeforeSceneLoad") autoCleanLinksBeforeSceneLoad=(v=="1" || v.Equals("true", StringComparison.OrdinalIgnoreCase));
@@ -1420,6 +1443,7 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
             keys.Sort(StringComparer.OrdinalIgnoreCase);
             for (int i = 0; i < keys.Count; i++) sb.Append("tabPage:").Append(keys[i]).Append('=').Append(Mathf.Max(0, tabPages[keys[i]])).Append('\n');
             sb.Append("autoOpenPanelInEditMode=").Append(autoOpenPanelInEditMode?"1":"0").Append('\n');
+            sb.Append("autoOpenPanelOnPluginLoad=").Append(autoOpenPanelOnPluginLoad?"1":"0").Append('\n');
             sb.Append("autoAllowAllPlugins=").Append(autoAllowAllPlugins?"1":"0").Append('\n');
             sb.Append("scanAllPackagesOnStartup=").Append(scanAllPackagesOnStartup?"1":"0").Append('\n');
             sb.Append("autoCleanLinksBeforeSceneLoad=").Append(autoCleanLinksBeforeSceneLoad?"1":"0").Append('\n');
@@ -1972,10 +1996,10 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         Image bgImg = root.AddComponent<Image>();
         bgImg.color = colBg;
 
-        float appBarH = isVRMode ? 60f : 56f;
-        float statusH = isVRMode ? 56f : 48f;
-        float navW = isVRMode ? 0.12f : 0.105f;
-        float inspectorL = 0.70f;
+        float appBarH = isVRMode ? 64f : 54f;
+        float statusH = isVRMode ? 58f : 46f;
+        float navW = isVRMode ? 0.13f : 0.11f;
+        float inspectorL = isVRMode ? 0.68f : 0.72f;
 
         // === APP BAR ===
         GameObject topBar = new GameObject("AppBar");
@@ -1995,9 +2019,9 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         GameObject searchObj = new GameObject("SearchBar");
         searchObj.transform.SetParent(topBar.transform, false);
         Image searchBg = searchObj.AddComponent<Image>();
-        searchBg.color = new Color(0.96f, 0.97f, 0.99f, 0.95f);
+        searchBg.color = new Color(0.12f, 0.14f, 0.18f, 0.98f);
         RectTransform searchRt = searchObj.GetComponent<RectTransform>();
-        searchRt.anchorMin = new Vector2(0.17f, 0.18f); searchRt.anchorMax = new Vector2(0.72f, 0.82f);
+        searchRt.anchorMin = new Vector2(0.16f, 0.16f); searchRt.anchorMax = new Vector2(0.78f, 0.84f);
         searchRt.offsetMin = Vector2.zero; searchRt.offsetMax = Vector2.zero;
         searchInput = searchObj.AddComponent<InputField>();
         Text searchTxt = MakeText(searchObj.transform, "Text", "", 15, TextAnchor.MiddleLeft, colTextPrimary);
@@ -2027,22 +2051,16 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
 
         settingsBtn = MakeButton(topBar.transform, "设置", 15, colBtn);
         RectTransform setRt = settingsBtn.GetComponent<RectTransform>();
-        setRt.anchorMin = new Vector2(0.73f, 0.15f); setRt.anchorMax = new Vector2(0.81f, 0.85f);
+        setRt.anchorMin = new Vector2(0.80f, 0.14f); setRt.anchorMax = new Vector2(0.89f, 0.86f);
         setRt.offsetMin = Vector2.zero; setRt.offsetMax = Vector2.zero;
         settingsBtn.onClick.AddListener(() => ToggleSettingsDrawer());
 
-        rescanTopBtn = MakeButton(topBar.transform, scanning ? "扫描中..." : "重新扫描", 15, colBtn);
-        RectTransform rescanRt = rescanTopBtn.GetComponent<RectTransform>();
-        rescanRt.anchorMin = new Vector2(0.815f, 0.15f); rescanRt.anchorMax = new Vector2(0.915f, 0.85f);
-        rescanRt.offsetMin = Vector2.zero; rescanRt.offsetMax = Vector2.zero;
-        rescanTopBtn.onClick.AddListener(() => {
-            if (scanning) { SetStatus("正在扫描中，请稍候...", false); return; }
-            ScanPackages(); RefreshList();
-        });
+        // 重新扫描移入设置抽屉，顶部只保留设置/关闭，降低拥挤感
+        rescanTopBtn = null;
 
-        Button closeTop = MakeButton(topBar.transform, "关闭", 15, new Color(0.85f, 0.30f, 0.30f, 0.90f));
+        Button closeTop = MakeButton(topBar.transform, "关闭", 15, colDanger);
         RectTransform closeRt = closeTop.GetComponent<RectTransform>();
-        closeRt.anchorMin = new Vector2(0.92f, 0.15f); closeRt.anchorMax = new Vector2(0.995f, 0.85f);
+        closeRt.anchorMin = new Vector2(0.90f, 0.14f); closeRt.anchorMax = new Vector2(0.995f, 0.86f);
         closeRt.offsetMin = Vector2.zero; closeRt.offsetMax = Vector2.zero;
         closeTop.onClick.AddListener(() => ClosePanel());
 
@@ -2060,7 +2078,7 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         navVlg.childControlWidth = true; navVlg.childControlHeight = false;
         navVlg.childAlignment = TextAnchor.UpperCenter;
 
-        tabCats = new string[]{"Favorites","Scenes","Presets","Clothing","Hair","Morphs","Scripts","Assets","All"};
+        tabCats = new string[]{"Favorites","Scenes","Presets","Clothing","Hair","Morphs","Scripts","All"};
         tabBgs.Clear();
         for (int i = 0; i < tabCats.Length; i++) {
             string cat = tabCats[i];
@@ -2072,9 +2090,9 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
             Button tabBtn = tabObj.AddComponent<Button>();
             tabBtn.targetGraphic = tabBg;
             LayoutElement tabLe = tabObj.AddComponent<LayoutElement>();
-            tabLe.preferredHeight = isVRMode ? 48f : 40f;
-            tabLe.minHeight = isVRMode ? 48f : 40f;
-            Text tabText = MakeText(tabObj.transform, "Label", CatLabel(cat), 15, TextAnchor.MiddleLeft, (cat == activeCat) ? colTextPrimary : colTextSecondary);
+            tabLe.preferredHeight = isVRMode ? 52f : 42f;
+            tabLe.minHeight = isVRMode ? 52f : 42f;
+            Text tabText = MakeText(tabObj.transform, "Label", CatLabel(cat), isVRMode ? 16 : 15, TextAnchor.MiddleLeft, (cat == activeCat) ? colTextPrimary : colTextSecondary);
             RectTransform trt = tabText.rectTransform;
             trt.anchorMin = Vector2.zero; trt.anchorMax = Vector2.one;
             trt.offsetMin = new Vector2(12, 0); trt.offsetMax = new Vector2(-6, 0);
@@ -2101,7 +2119,7 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         subBarRoot = new GameObject("ResultToolbar");
         subBarRoot.transform.SetParent(root.transform, false);
         Image subBarBg = subBarRoot.AddComponent<Image>();
-        subBarBg.color = new Color(0.94f, 0.96f, 0.98f, 0.90f);
+        subBarBg.color = new Color(0.16f, 0.18f, 0.23f, 0.96f);
         RectTransform subBarRt = subBarRoot.GetComponent<RectTransform>();
         subBarRt.anchorMin = new Vector2(navW, 1f - (appBarH + 40f) / 1080f);
         subBarRt.anchorMax = new Vector2(inspectorL, 1f - appBarH / 1080f);
@@ -2180,15 +2198,12 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         SetFlexibleItem(applyHairToggle.gameObject, 0f, 1f);
         applyHairToggle.onValueChanged.AddListener((bool v) => { applyHair = v; SetStatus("预设加载：" + (v ? "包含头发" : "仅模型头发不变"), false); });
 
-        presetModeRoot = CreateRow(detailContent.transform, "PresetModeRow", 36f, 6, true);
-        // 快捷模式默认都带头发；不带头发只能通过“包含头发”开关显式关闭
-        Button modelOnly = MakeButton(presetModeRoot.transform, "模型+头发", 13, colBtn); SetFlexibleItem(modelOnly.gameObject, 0f, 1f); modelOnly.onClick.AddListener(() => SetPresetApplyMode(false, true));
-        Button modelClothing = MakeButton(presetModeRoot.transform, "模型+服装+头发", 13, colBtn); SetFlexibleItem(modelClothing.gameObject, 0f, 1f); modelClothing.onClick.AddListener(() => SetPresetApplyMode(true, true));
-        Button modelAll = MakeButton(presetModeRoot.transform, "全套外观", 13, colAccentDim); SetFlexibleItem(modelAll.gameObject, 0f, 1f); modelAll.onClick.AddListener(() => SetPresetApplyMode(true, true));
+        // 快捷模式按钮已移除：只保留“包含服装/头发”开关，界面更干净
+        presetModeRoot = null;
 
         // Primary actions - only one relevant will show
-        sceneActionRoot = CreateRow(detailContent.transform, "SceneActionRow", 46f, 8, true);
-        loadSceneBtn = MakeButton(sceneActionRoot.transform, "加载场景", 16, colAccent);
+        sceneActionRoot = CreateRow(detailContent.transform, "SceneActionRow", isVRMode ? 50f : 46f, 8, true);
+        loadSceneBtn = MakeButton(sceneActionRoot.transform, "加载场景", isVRMode ? 17 : 16, colAccent);
         SetFlexibleItem(loadSceneBtn.gameObject, 0f, 1f);
         loadSceneBtn.onClick.AddListener(() => {
             if (selectedSceneItem != null) LoadPackageScene(selectedSceneItem.package, selectedSceneItem.entryPath);
@@ -2196,12 +2211,12 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         });
 
         presetActionRoot = CreateRow(detailContent.transform, "PresetActionRow", 46f, 8, true);
-        applyPresetBtn = MakeButton(presetActionRoot.transform, "应用到人物", 16, new Color(0.180f, 0.550f, 0.340f, 0.95f));
+        applyPresetBtn = MakeButton(presetActionRoot.transform, "应用到人物", isVRMode ? 17 : 16, colSuccess);
         SetFlexibleItem(applyPresetBtn.gameObject, 0f, 1f);
         applyPresetBtn.onClick.AddListener(() => ApplySelectedPresetToAtom());
 
         moreActionsRoot = CreateRow(detailContent.transform, "ScriptActionRow", 46f, 8, true);
-        loadScriptBtn = MakeButton(moreActionsRoot.transform, "加载到原子", 16, new Color(0.400f, 0.300f, 0.650f, 0.95f));
+        loadScriptBtn = MakeButton(moreActionsRoot.transform, "加载到原子", isVRMode ? 17 : 16, new Color(0.48f, 0.38f, 0.78f, 0.96f));
         SetFlexibleItem(loadScriptBtn.gameObject, 0f, 1f);
         loadScriptBtn.onClick.AddListener(() => LoadScriptToAtom());
 
@@ -2216,24 +2231,21 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         SetFlexibleItem(favToggleBtn.gameObject, 0f, 1f);
         favToggleBtn.onClick.AddListener(() => ToggleFavoriteSelected());
 
-        hubRowRoot = CreateRow(detailContent.transform, "HubRow", 40f, 6, true);
-        Button hubDetailBtn = MakeButton(hubRowRoot.transform, "Hub详情", 14, new Color(0.22f, 0.48f, 0.78f, 0.92f));
+        hubRowRoot = CreateRow(detailContent.transform, "HubRow", isVRMode ? 44f : 40f, 6, true);
+        Button hubDetailBtn = MakeButton(hubRowRoot.transform, "Hub", 14, colAccentDim);
         SetFlexibleItem(hubDetailBtn.gameObject, 0f, 1f);
         hubDetailBtn.onClick.AddListener(() => OpenSelectedInHub());
-        Button hubSearchBtn = MakeButton(hubRowRoot.transform, "Hub搜索", 14, new Color(0.30f, 0.56f, 0.84f, 0.92f));
-        SetFlexibleItem(hubSearchBtn.gameObject, 0f, 1f);
-        hubSearchBtn.onClick.AddListener(() => SearchSelectedInHub());
-        Button hubDepsBtn = MakeButton(hubRowRoot.transform, "检查依赖", 14, new Color(0.40f, 0.48f, 0.68f, 0.92f));
+        Button hubDepsBtn = MakeButton(hubRowRoot.transform, "检查依赖", 14, colBtn);
         SetFlexibleItem(hubDepsBtn.gameObject, 0f, 1f);
         hubDepsBtn.onClick.AddListener(() => CheckSelectedMissingDeps());
 
-        hubDownloadRoot = CreateRow(detailContent.transform, "HubDownloadRow", 40f, 6, true);
-        hubDownloadButton = MakeButton(hubDownloadRoot.transform, missingDepsDownloadRunning ? "取消下载" : "Hub下载/本地补链", 14, new Color(0.18f, 0.55f, 0.46f, 0.95f));
+        hubDownloadRoot = CreateRow(detailContent.transform, "HubDownloadRow", isVRMode ? 44f : 40f, 6, true);
+        hubDownloadButton = MakeButton(hubDownloadRoot.transform, missingDepsDownloadRunning ? "取消下载" : "下载缺失依赖", 14, colSuccess);
         SetFlexibleItem(hubDownloadButton.gameObject, 0f, 1f);
         hubDownloadButton.onClick.AddListener(() => DownloadSelectedMissingDepsToLibrary());
 
         progressSectionRoot = CreateSection(detailContent.transform, "DownloadProgress", 52f);
-        progressSectionRoot.GetComponent<Image>().color = new Color(0.80f, 0.84f, 0.90f, 0.70f);
+        progressSectionRoot.GetComponent<Image>().color = new Color(0.12f, 0.16f, 0.20f, 0.90f);
         GameObject progressFillObj = new GameObject("Fill");
         progressFillObj.transform.SetParent(progressSectionRoot.transform, false);
         downloadProgressFill = progressFillObj.AddComponent<Image>();
@@ -2246,7 +2258,7 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         downloadProgressText.raycastTarget = false;
         StretchFull(downloadProgressText.rectTransform, 8, 8, 4, 4);
 
-        Text hint = MakeText(detailContent.transform, "Hint", "F8/F7 桌面窗口 · VR 手势呼出 · 危险操作请进设置→维护", 12, TextAnchor.MiddleCenter, colTextDim);
+        Text hint = MakeText(detailContent.transform, "Hint", "F8/F7 打开 · VR 手势 · 设置里可维护/扫描", 12, TextAnchor.MiddleCenter, colTextDim);
         hint.horizontalOverflow = HorizontalWrapMode.Wrap;
         hint.verticalOverflow = VerticalWrapMode.Overflow;
         SetFixedHeight(hint.gameObject, 28f);
@@ -2329,8 +2341,8 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         crt.sizeDelta = new Vector2(0, 0);
 
         GridLayoutGroup grid = co.AddComponent<GridLayoutGroup>();
-        float cellW = isVRMode ? 180f : 170f;
-        float cellH = isVRMode ? 210f : 190f;
+        float cellW = isVRMode ? 188f : 168f;
+        float cellH = isVRMode ? 220f : 188f;
         grid.cellSize = new Vector2(cellW, cellH);
         grid.spacing = new Vector2(10, 12);
         grid.padding = new RectOffset(4, 4, 10, 10);
@@ -2450,11 +2462,13 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
             AddToolbarChip("其他", allSubFilter == "Other", () => { allSubFilter = "Other"; page = 0; SaveCurrentPageState(); ClearSelectionKeepPreview(false); RefreshList(); });
         }
 
-        // Page size presets (compact)
-        int[] sizes = isVRMode ? new int[]{24,48,64} : new int[]{32,64,128};
-        for (int i = 0; i < sizes.Length; i++) {
-            int n = sizes[i];
-            AddToolbarChip(n + "/页", pageSize == n, () => SetPageSize(n));
+        // 页容量：桌面保留 2 个常用档；VR 默认固定，减少工具条噪音
+        if (!isVRMode) {
+            int[] sizes = new int[]{48, 96};
+            for (int i = 0; i < sizes.Length; i++) {
+                int n = sizes[i];
+                AddToolbarChip(n + "/页", pageSize == n, () => SetPageSize(n));
+            }
         }
     }
 
@@ -4319,12 +4333,22 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
 
         Text g1 = MakeText(content.transform, "G1", "常规", 15, TextAnchor.MiddleLeft, colAccent);
         SetFixedHeight(g1.gameObject, 24f);
-        Toggle autoOpenTg = MakeToggle(content.transform, "编辑模式启动自动打开窗口", autoOpenPanelInEditMode);
-        SetFixedHeight(autoOpenTg.gameObject, 34f);
-        autoOpenTg.onValueChanged.AddListener((bool v) => { autoOpenPanelInEditMode = v; SaveConfig(); SetStatus("编辑模式启动自动打开窗口：" + (v ? "开" : "关"), true); });
+        Toggle autoOpenLoadTg = MakeToggle(content.transform, "插件加载后自动打开界面", autoOpenPanelOnPluginLoad);
+        SetFixedHeight(autoOpenLoadTg.gameObject, isVRMode ? 40f : 34f);
+        autoOpenLoadTg.onValueChanged.AddListener((bool v) => { autoOpenPanelOnPluginLoad = v; SaveConfig(); SetStatus("插件加载后自动打开界面：" + (v ? "开" : "关"), true); });
+        Toggle autoOpenTg = MakeToggle(content.transform, "仅编辑模式自动打开（旧）", autoOpenPanelInEditMode);
+        SetFixedHeight(autoOpenTg.gameObject, isVRMode ? 40f : 34f);
+        autoOpenTg.onValueChanged.AddListener((bool v) => { autoOpenPanelInEditMode = v; SaveConfig(); SetStatus("编辑模式自动打开：" + (v ? "开" : "关"), true); });
         Toggle autoAllowPluginTg = MakeToggle(content.transform, "总是允许加载所有插件", autoAllowAllPlugins);
-        SetFixedHeight(autoAllowPluginTg.gameObject, 34f);
+        SetFixedHeight(autoAllowPluginTg.gameObject, isVRMode ? 40f : 34f);
         autoAllowPluginTg.onValueChanged.AddListener((bool v) => { autoAllowAllPlugins = v; SaveConfig(); SetStatus("总是允许加载所有插件：" + (v ? "开" : "关"), true); if(v) Invoke("AutoAllowAllPendingPluginPackages", 0.2f); });
+        Button rescanSet = MakeButton(content.transform, scanning ? "扫描中..." : "重新扫描资源库", 15, colAccentDim);
+        SetFixedHeight(rescanSet.gameObject, isVRMode ? 46f : 40f);
+        rescanTopBtn = rescanSet;
+        rescanSet.onClick.AddListener(() => {
+            if (scanning) { SetStatus("正在扫描中，请稍候...", false); return; }
+            ScanPackages(); RefreshList(); SetStatus("已触发重新扫描", true);
+        });
 
         Text g2 = MakeText(content.transform, "G2", "扫描与加载", 15, TextAnchor.MiddleLeft, colAccent);
         SetFixedHeight(g2.gameObject, 24f);
@@ -4354,10 +4378,10 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         Text g4 = MakeText(content.transform, "G4", "维护（危险）", 15, TextAnchor.MiddleLeft, new Color(0.85f, 0.30f, 0.30f, 1f));
         SetFixedHeight(g4.gameObject, 24f);
         dangerRowRoot = CreateRow(content.transform, "DangerRow", 42f, 8, true);
-        Button clear = MakeButton(dangerRowRoot.transform, "清除生成链接", 14, new Color(0.85f, 0.40f, 0.40f, 0.85f));
+        Button clear = MakeButton(dangerRowRoot.transform, "清除生成链接", 14, colDanger);
         SetFlexibleItem(clear.gameObject, 0f, 1f);
         clear.onClick.AddListener(() => ShowClearConfirm());
-        Button deleteBtn = MakeButton(dangerRowRoot.transform, "删除真实包", 14, new Color(0.90f, 0.25f, 0.25f, 0.90f));
+        Button deleteBtn = MakeButton(dangerRowRoot.transform, "删除真实包", 14, colDanger);
         SetFlexibleItem(deleteBtn.gameObject, 0f, 1f);
         deleteBtn.onClick.AddListener(() => DeleteSelectedPackage());
 
@@ -4468,7 +4492,7 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
 
         SetGoActive(atomRowRoot, isPreset || isScript || isWearable);
         SetGoActive(presetOptionsRoot, isPreset);
-        SetGoActive(presetModeRoot, isPreset);
+        SetGoActive(presetModeRoot, false); // 快捷模式已移除
         SetGoActive(sceneActionRoot, isScene || (selected != null && selected.firstScene != "" && activeCat == "Scenes" && selectedSceneItem == null));
         SetGoActive(presetActionRoot, isPreset);
         SetGoActive(moreActionsRoot, isScript);
@@ -4567,7 +4591,7 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         GameObject go = new GameObject("Toggle"); go.transform.SetParent(parent, false);
         RectTransform goRt = go.AddComponent<RectTransform>(); goRt.anchorMin = Vector2.zero; goRt.anchorMax = Vector2.one; goRt.offsetMin = Vector2.zero; goRt.offsetMax = Vector2.zero;
         GameObject box = new GameObject("Box"); box.transform.SetParent(go.transform, false);
-        Image boxImg = box.AddComponent<Image>(); boxImg.color = new Color(0.90f, 0.92f, 0.95f, 0.95f);
+        Image boxImg = box.AddComponent<Image>(); boxImg.color = new Color(0.12f, 0.14f, 0.18f, 0.98f);
         RectTransform boxRt = box.GetComponent<RectTransform>(); boxRt.anchorMin = new Vector2(0, 0.1f); boxRt.anchorMax = new Vector2(0, 0.9f); boxRt.pivot = new Vector2(0, 0.5f); boxRt.anchoredPosition = new Vector2(2, 0); boxRt.sizeDelta = new Vector2(18, 0);
         GameObject check = new GameObject("Check"); check.transform.SetParent(box.transform, false);
         Image checkImg = check.AddComponent<Image>(); checkImg.color = colAccent;
