@@ -2011,57 +2011,85 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         topBarRt.pivot = new Vector2(0.5f, 1);
         topBarRt.offsetMin = new Vector2(0, -appBarH); topBarRt.offsetMax = new Vector2(0, 0);
 
-        header = MakeText(topBar.transform, "Header", "AllPackagesLinker", 18, TextAnchor.MiddleLeft, colTextPrimary);
+        // 顶栏三段式：标题 | 搜索 | 右侧重按钮（固定宽度+间距，避免挤成一团）
+        header = MakeText(topBar.transform, "Header", "AllPackagesLinker", isVRMode ? 17 : 16, TextAnchor.MiddleLeft, colTextPrimary);
         RectTransform hrt = header.rectTransform;
-        hrt.anchorMin = new Vector2(0, 0); hrt.anchorMax = new Vector2(0.16f, 1);
-        hrt.offsetMin = new Vector2(16, 0); hrt.offsetMax = new Vector2(0, 0);
+        hrt.anchorMin = new Vector2(0, 0); hrt.anchorMax = new Vector2(0, 1);
+        hrt.pivot = new Vector2(0, 0.5f);
+        hrt.anchoredPosition = new Vector2(14, 0);
+        hrt.sizeDelta = new Vector2(isVRMode ? 200f : 180f, 0);
+
+        float rightClusterW = isVRMode ? 280f : 240f; // 设置 + 间距 + 关闭
+        float titleW = isVRMode ? 210f : 190f;
+        float sidePad = 12f;
+        float topBtnGap = 12f;
 
         GameObject searchObj = new GameObject("SearchBar");
         searchObj.transform.SetParent(topBar.transform, false);
         Image searchBg = searchObj.AddComponent<Image>();
         searchBg.color = new Color(0.12f, 0.14f, 0.18f, 0.98f);
         RectTransform searchRt = searchObj.GetComponent<RectTransform>();
-        searchRt.anchorMin = new Vector2(0.16f, 0.16f); searchRt.anchorMax = new Vector2(0.78f, 0.84f);
-        searchRt.offsetMin = Vector2.zero; searchRt.offsetMax = Vector2.zero;
+        searchRt.anchorMin = new Vector2(0, 0.14f); searchRt.anchorMax = new Vector2(1, 0.86f);
+        searchRt.pivot = new Vector2(0.5f, 0.5f);
+        searchRt.offsetMin = new Vector2(titleW, 0);
+        searchRt.offsetMax = new Vector2(-(rightClusterW + sidePad + 8f), 0);
         searchInput = searchObj.AddComponent<InputField>();
         Text searchTxt = MakeText(searchObj.transform, "Text", "", 15, TextAnchor.MiddleLeft, colTextPrimary);
         RectTransform stxtRt = searchTxt.rectTransform;
         stxtRt.anchorMin = Vector2.zero; stxtRt.anchorMax = Vector2.one;
-        stxtRt.offsetMin = new Vector2(12, 0); stxtRt.offsetMax = new Vector2(-40, 0);
+        stxtRt.offsetMin = new Vector2(12, 0); stxtRt.offsetMax = new Vector2(-44, 0);
         searchPlaceholderText = MakeText(searchObj.transform, "Placeholder", "搜索场景名、包名或作者...", 15, TextAnchor.MiddleLeft, colTextDim);
         RectTransform sphRt = searchPlaceholderText.rectTransform;
         sphRt.anchorMin = Vector2.zero; sphRt.anchorMax = Vector2.one;
-        sphRt.offsetMin = new Vector2(12, 0); sphRt.offsetMax = new Vector2(-40, 0);
+        sphRt.offsetMin = new Vector2(12, 0); sphRt.offsetMax = new Vector2(-44, 0);
         searchInput.textComponent = searchTxt;
         searchInput.placeholder = searchPlaceholderText;
         if (!string.IsNullOrEmpty(searchQuery)) searchInput.text = searchQuery;
         searchInput.onValueChanged.AddListener((string val) => { searchQuery = val; page = 0; SaveCurrentPageState(); RefreshList(); });
 
-        searchClearBtn = MakeButton(searchObj.transform, "×", 16, new Color(0.90f, 0.92f, 0.95f, 0.95f));
+        searchClearBtn = MakeButton(searchObj.transform, "×", 16, colBtn);
         RectTransform clearRt = searchClearBtn.GetComponent<RectTransform>();
-        clearRt.anchorMin = new Vector2(1, 0.1f); clearRt.anchorMax = new Vector2(1, 0.9f);
+        clearRt.anchorMin = new Vector2(1, 0.12f); clearRt.anchorMax = new Vector2(1, 0.88f);
         clearRt.pivot = new Vector2(1, 0.5f);
-        clearRt.anchoredPosition = new Vector2(-4, 0);
-        clearRt.sizeDelta = new Vector2(32, 0);
+        clearRt.anchoredPosition = new Vector2(-6, 0);
+        clearRt.sizeDelta = new Vector2(34, 0);
         searchClearBtn.onClick.AddListener(() => {
             searchQuery = "";
             if (searchInput != null) searchInput.text = "";
             page = 0; SaveCurrentPageState(); RefreshList();
         });
 
-        settingsBtn = MakeButton(topBar.transform, "设置", 15, colBtn);
-        RectTransform setRt = settingsBtn.GetComponent<RectTransform>();
-        setRt.anchorMin = new Vector2(0.80f, 0.14f); setRt.anchorMax = new Vector2(0.89f, 0.86f);
-        setRt.offsetMin = Vector2.zero; setRt.offsetMax = Vector2.zero;
+        // 右侧按钮容器：水平排布，明确间距
+        GameObject rightBar = new GameObject("RightActions");
+        rightBar.transform.SetParent(topBar.transform, false);
+        RectTransform rightRt = rightBar.AddComponent<RectTransform>();
+        rightRt.anchorMin = new Vector2(1, 0); rightRt.anchorMax = new Vector2(1, 1);
+        rightRt.pivot = new Vector2(1, 0.5f);
+        rightRt.anchoredPosition = new Vector2(-sidePad, 0);
+        rightRt.sizeDelta = new Vector2(rightClusterW, 0);
+        HorizontalLayoutGroup rightHlg = rightBar.AddComponent<HorizontalLayoutGroup>();
+        rightHlg.spacing = topBtnGap;
+        rightHlg.childAlignment = TextAnchor.MiddleRight;
+        rightHlg.childForceExpandWidth = false;
+        rightHlg.childForceExpandHeight = true;
+        rightHlg.childControlWidth = true;
+        rightHlg.childControlHeight = true;
+        rightHlg.padding = new RectOffset(0, 0, 6, 6);
+
+        float topBtnW = isVRMode ? 120f : 100f;
+        settingsBtn = MakeButton(rightBar.transform, "设置", isVRMode ? 16 : 15, colAccentDim);
+        SetFlexibleItem(settingsBtn.gameObject, topBtnW, 0f);
+        LayoutElement setLe = settingsBtn.gameObject.GetComponent<LayoutElement>();
+        if (setLe != null) { setLe.preferredWidth = topBtnW; setLe.minWidth = topBtnW; }
         settingsBtn.onClick.AddListener(() => ToggleSettingsDrawer());
 
-        // 重新扫描移入设置抽屉，顶部只保留设置/关闭，降低拥挤感
+        // 重新扫描移入设置抽屉
         rescanTopBtn = null;
 
-        Button closeTop = MakeButton(topBar.transform, "关闭", 15, colDanger);
-        RectTransform closeRt = closeTop.GetComponent<RectTransform>();
-        closeRt.anchorMin = new Vector2(0.90f, 0.14f); closeRt.anchorMax = new Vector2(0.995f, 0.86f);
-        closeRt.offsetMin = Vector2.zero; closeRt.offsetMax = Vector2.zero;
+        Button closeTop = MakeButton(rightBar.transform, "关闭", isVRMode ? 16 : 15, colDanger);
+        SetFlexibleItem(closeTop.gameObject, topBtnW, 0f);
+        LayoutElement closeLe = closeTop.gameObject.GetComponent<LayoutElement>();
+        if (closeLe != null) { closeLe.preferredWidth = topBtnW; closeLe.minWidth = topBtnW; }
         closeTop.onClick.AddListener(() => ClosePanel());
 
         // === LEFT NAV ===
@@ -2258,7 +2286,7 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         downloadProgressText.raycastTarget = false;
         StretchFull(downloadProgressText.rectTransform, 8, 8, 4, 4);
 
-        Text hint = MakeText(detailContent.transform, "Hint", "F8/F7 打开 · VR 手势 · 设置里可维护/扫描", 12, TextAnchor.MiddleCenter, colTextDim);
+        Text hint = MakeText(detailContent.transform, "Hint", "F8/F7 打开 · 右上角【设置】可开关：插件加载后自动打开", 12, TextAnchor.MiddleCenter, colTextDim);
         hint.horizontalOverflow = HorizontalWrapMode.Wrap;
         hint.verticalOverflow = VerticalWrapMode.Overflow;
         SetFixedHeight(hint.gameObject, 28f);
@@ -4305,15 +4333,17 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         Image drawerBg = settingsDrawerRoot.AddComponent<Image>();
         drawerBg.color = colPanel;
         RectTransform dr = settingsDrawerRoot.GetComponent<RectTransform>();
-        dr.anchorMin = new Vector2(0.62f, 0.08f); dr.anchorMax = new Vector2(0.985f, 0.92f);
+        // 更宽的设置面板，避免选项文字被裁切
+        dr.anchorMin = new Vector2(isVRMode ? 0.48f : 0.52f, 0.06f);
+        dr.anchorMax = new Vector2(0.985f, 0.94f);
         dr.offsetMin = Vector2.zero; dr.offsetMax = Vector2.zero;
 
         ScrollRect scroll = settingsDrawerRoot.AddComponent<ScrollRect>();
-        scroll.horizontal = false; scroll.scrollSensitivity = 24f;
+        scroll.horizontal = false; scroll.scrollSensitivity = 28f;
         GameObject vp = new GameObject("Viewport");
         vp.transform.SetParent(settingsDrawerRoot.transform, false);
         RectTransform vrt = vp.AddComponent<RectTransform>();
-        StretchFull(vrt, 10, 10, 10, 10);
+        StretchFull(vrt, 12, 12, 12, 12);
         vp.AddComponent<Image>().color = new Color(0,0,0,0.01f);
         vp.AddComponent<Mask>().showMaskGraphic = false;
         GameObject content = new GameObject("Content");
@@ -4322,28 +4352,36 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         crt.anchorMin = new Vector2(0, 1); crt.anchorMax = new Vector2(1, 1);
         crt.pivot = new Vector2(0.5f, 1); crt.offsetMin = Vector2.zero; crt.offsetMax = Vector2.zero;
         VerticalLayoutGroup vlg = content.AddComponent<VerticalLayoutGroup>();
-        vlg.spacing = 8; vlg.padding = new RectOffset(8, 8, 8, 8);
+        vlg.spacing = 10; vlg.padding = new RectOffset(10, 10, 10, 16);
         vlg.childControlWidth = true; vlg.childControlHeight = false;
         vlg.childForceExpandWidth = true; vlg.childForceExpandHeight = false;
         content.AddComponent<ContentSizeFitter>().verticalFit = ContentSizeFitter.FitMode.PreferredSize;
         scroll.viewport = vrt; scroll.content = crt;
 
-        Text title = MakeText(content.transform, "Title", "设置与维护", 18, TextAnchor.MiddleLeft, colTextPrimary);
-        SetFixedHeight(title.gameObject, 32f);
+        Text title = MakeText(content.transform, "Title", "设置与维护", 20, TextAnchor.MiddleLeft, colTextPrimary);
+        SetFixedHeight(title.gameObject, 36f);
+        Text tip = MakeText(content.transform, "Tip", "下面这些是全局设置，不在收藏/脚本列表里。", 13, TextAnchor.MiddleLeft, colTextDim);
+        SetFixedHeight(tip.gameObject, 24f);
 
-        Text g1 = MakeText(content.transform, "G1", "常规", 15, TextAnchor.MiddleLeft, colAccent);
-        SetFixedHeight(g1.gameObject, 24f);
-        Toggle autoOpenLoadTg = MakeToggle(content.transform, "插件加载后自动打开界面", autoOpenPanelOnPluginLoad);
-        SetFixedHeight(autoOpenLoadTg.gameObject, isVRMode ? 40f : 34f);
+        Text g1 = MakeText(content.transform, "G1", "启动与打开", 16, TextAnchor.MiddleLeft, colAccent);
+        SetFixedHeight(g1.gameObject, 28f);
+        // 最显眼的首项：插件加载后自动打开
+        Toggle autoOpenLoadTg = MakeToggle(content.transform, "插件加载后自动打开本界面", autoOpenPanelOnPluginLoad);
+        SetFixedHeight(autoOpenLoadTg.gameObject, isVRMode ? 48f : 42f);
         autoOpenLoadTg.onValueChanged.AddListener((bool v) => { autoOpenPanelOnPluginLoad = v; SaveConfig(); SetStatus("插件加载后自动打开界面：" + (v ? "开" : "关"), true); });
-        Toggle autoOpenTg = MakeToggle(content.transform, "仅编辑模式自动打开（旧）", autoOpenPanelInEditMode);
-        SetFixedHeight(autoOpenTg.gameObject, isVRMode ? 40f : 34f);
+        Text autoOpenHint = MakeText(content.transform, "AutoOpenHint", "开启后：BepInEx 加载本插件约 2 秒会自动弹出窗口（桌面）。", 12, TextAnchor.UpperLeft, colTextSecondary);
+        autoOpenHint.horizontalOverflow = HorizontalWrapMode.Wrap;
+        autoOpenHint.verticalOverflow = VerticalWrapMode.Overflow;
+        SetFixedHeight(autoOpenHint.gameObject, 36f);
+
+        Toggle autoOpenTg = MakeToggle(content.transform, "仅编辑模式自动打开（兼容旧选项）", autoOpenPanelInEditMode);
+        SetFixedHeight(autoOpenTg.gameObject, isVRMode ? 44f : 40f);
         autoOpenTg.onValueChanged.AddListener((bool v) => { autoOpenPanelInEditMode = v; SaveConfig(); SetStatus("编辑模式自动打开：" + (v ? "开" : "关"), true); });
         Toggle autoAllowPluginTg = MakeToggle(content.transform, "总是允许加载所有插件", autoAllowAllPlugins);
-        SetFixedHeight(autoAllowPluginTg.gameObject, isVRMode ? 40f : 34f);
+        SetFixedHeight(autoAllowPluginTg.gameObject, isVRMode ? 44f : 40f);
         autoAllowPluginTg.onValueChanged.AddListener((bool v) => { autoAllowAllPlugins = v; SaveConfig(); SetStatus("总是允许加载所有插件：" + (v ? "开" : "关"), true); if(v) Invoke("AutoAllowAllPendingPluginPackages", 0.2f); });
         Button rescanSet = MakeButton(content.transform, scanning ? "扫描中..." : "重新扫描资源库", 15, colAccentDim);
-        SetFixedHeight(rescanSet.gameObject, isVRMode ? 46f : 40f);
+        SetFixedHeight(rescanSet.gameObject, isVRMode ? 48f : 42f);
         rescanTopBtn = rescanSet;
         rescanSet.onClick.AddListener(() => {
             if (scanning) { SetStatus("正在扫描中，请稍候...", false); return; }
@@ -4589,16 +4627,36 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
     }
     private Toggle MakeToggle(Transform parent, string label, bool initial) {
         GameObject go = new GameObject("Toggle"); go.transform.SetParent(parent, false);
-        RectTransform goRt = go.AddComponent<RectTransform>(); goRt.anchorMin = Vector2.zero; goRt.anchorMax = Vector2.one; goRt.offsetMin = Vector2.zero; goRt.offsetMax = Vector2.zero;
+        RectTransform goRt = go.AddComponent<RectTransform>();
+        // 在 VerticalLayoutGroup 中使用顶部拉伸宽度，而不是填满父级
+        goRt.anchorMin = new Vector2(0, 1); goRt.anchorMax = new Vector2(1, 1);
+        goRt.pivot = new Vector2(0.5f, 1);
+        goRt.sizeDelta = new Vector2(0, 40);
+        Image rowBg = go.AddComponent<Image>();
+        rowBg.color = new Color(0.14f, 0.16f, 0.20f, 0.55f);
+        rowBg.raycastTarget = true;
+
         GameObject box = new GameObject("Box"); box.transform.SetParent(go.transform, false);
-        Image boxImg = box.AddComponent<Image>(); boxImg.color = new Color(0.12f, 0.14f, 0.18f, 0.98f);
-        RectTransform boxRt = box.GetComponent<RectTransform>(); boxRt.anchorMin = new Vector2(0, 0.1f); boxRt.anchorMax = new Vector2(0, 0.9f); boxRt.pivot = new Vector2(0, 0.5f); boxRt.anchoredPosition = new Vector2(2, 0); boxRt.sizeDelta = new Vector2(18, 0);
+        Image boxImg = box.AddComponent<Image>(); boxImg.color = new Color(0.10f, 0.12f, 0.16f, 1f);
+        RectTransform boxRt = box.GetComponent<RectTransform>();
+        boxRt.anchorMin = new Vector2(0, 0.5f); boxRt.anchorMax = new Vector2(0, 0.5f);
+        boxRt.pivot = new Vector2(0, 0.5f);
+        boxRt.anchoredPosition = new Vector2(10, 0);
+        boxRt.sizeDelta = new Vector2(isVRMode ? 26f : 22f, isVRMode ? 26f : 22f);
+
         GameObject check = new GameObject("Check"); check.transform.SetParent(box.transform, false);
         Image checkImg = check.AddComponent<Image>(); checkImg.color = colAccent;
-        RectTransform chkRt = check.GetComponent<RectTransform>(); chkRt.anchorMin = new Vector2(0.2f, 0.2f); chkRt.anchorMax = new Vector2(0.8f, 0.8f); chkRt.offsetMin = Vector2.zero; chkRt.offsetMax = Vector2.zero;
-        Toggle tg = go.AddComponent<Toggle>(); tg.targetGraphic = boxImg; tg.graphic = checkImg; tg.isOn = initial;
-        Text lbl = MakeText(go.transform, "Label", label, 12, TextAnchor.MiddleLeft, colTextSecondary);
-        RectTransform lblRt = lbl.rectTransform; lblRt.anchorMin = Vector2.zero; lblRt.anchorMax = Vector2.one; lblRt.offsetMin = new Vector2(22, 0); lblRt.offsetMax = Vector2.zero;
+        RectTransform chkRt = check.GetComponent<RectTransform>();
+        chkRt.anchorMin = new Vector2(0.18f, 0.18f); chkRt.anchorMax = new Vector2(0.82f, 0.82f);
+        chkRt.offsetMin = Vector2.zero; chkRt.offsetMax = Vector2.zero;
+
+        Toggle tg = go.AddComponent<Toggle>(); tg.targetGraphic = rowBg; tg.graphic = checkImg; tg.isOn = initial;
+        Text lbl = MakeText(go.transform, "Label", label, isVRMode ? 15 : 14, TextAnchor.MiddleLeft, colTextPrimary);
+        lbl.horizontalOverflow = HorizontalWrapMode.Wrap;
+        lbl.verticalOverflow = VerticalWrapMode.Truncate;
+        RectTransform lblRt = lbl.rectTransform;
+        lblRt.anchorMin = Vector2.zero; lblRt.anchorMax = Vector2.one;
+        lblRt.offsetMin = new Vector2(isVRMode ? 48f : 42f, 4); lblRt.offsetMax = new Vector2(-10, -4);
         return tg;
     }
     private InputField MakeInput(Transform parent,string placeholder){ GameObject go=new GameObject("Input"); go.transform.SetParent(parent,false); Image img=go.AddComponent<Image>(); img.color=new Color(0.94f,0.95f,0.97f,1f); InputField input=go.AddComponent<InputField>(); Text txt=Text(go.transform,"Text","",16,TextAnchor.MiddleLeft); txt.color=colTextPrimary; Rect(txt.rectTransform,8,0,390,38); Text ph=Text(go.transform,"Placeholder",placeholder,16,TextAnchor.MiddleLeft); ph.color=colTextDim; Rect(ph.rectTransform,8,0,390,38); input.textComponent=txt; input.placeholder=ph; return input; }
