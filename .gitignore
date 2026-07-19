@@ -1,0 +1,53 @@
+# Local backups and historical snapshots
+backup_*/
+*.bak
+*.bak_*
+*.bak_*/*
+AllPackagesLinkerBepInEx.cs.bak*
+AllPackagesLinker.dll.bak*
+AllPackagesLinker.dll.bad*
+AllPackagesLinker.dll.pending*
+AllPackagesLinker.favtabs.build.dll.disabled
+AllPackagesLinker.dll.disabled*
+
+# Build intermediates / local disabled copies
+_build/*.dll.disabled*
+_build/*.test.dll.disabled
+_build/AllPackagesLinker.dll.disabled*
+
+# Ad-hoc dump / reverse-engineering tools (not part of the plugin)
+_cecil_dump.*
+_dump_*
+_inspect_vam.*
+_reflect_presets.*
+_scan_strings.*
+_hub4.txt
+_hub_reflect.txt
+_build_refs.txt
+_ui_refactor_patch*.py
+Mono.Cecil.dll
+
+# Reference / third-party extracted sources (not this plugin)
+_BrowserAssist90.zip
+_BrowserAssist90_src/
+
+# Logs and temp
+*.log
+*.tmp
+*.temp
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# IDE / editor
+.vs/
+.vscode/
+*.user
+*.suo
+*.swp
+*~
+
+# Optional local secrets (if any appear later)
+.env
+.env.*
+credentials*
