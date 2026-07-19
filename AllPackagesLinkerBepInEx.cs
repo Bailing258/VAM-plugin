@@ -2190,7 +2190,7 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         dcRt.pivot = new Vector2(0.5f, 1);
         dcRt.offsetMin = Vector2.zero; dcRt.offsetMax = Vector2.zero;
         VerticalLayoutGroup detailVlg = detailContent.AddComponent<VerticalLayoutGroup>();
-        detailVlg.spacing = 8; detailVlg.padding = new RectOffset(0, 0, 0, 8);
+        detailVlg.spacing = 12; detailVlg.padding = new RectOffset(4, 4, 4, 12);
         detailVlg.childAlignment = TextAnchor.UpperCenter;
         detailVlg.childControlWidth = true; detailVlg.childControlHeight = false;
         detailVlg.childForceExpandWidth = true; detailVlg.childForceExpandHeight = false;
@@ -2199,15 +2199,26 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         detailScroll.viewport = dvRt;
         detailScroll.content = dcRt;
 
-        preview = MakeImage(CreateSection(detailContent.transform, "PreviewSection", 240f).transform, "Preview", colThumbBg);
+        // 预览略缩小，给详情和按钮留空间
+        preview = MakeImage(CreateSection(detailContent.transform, "PreviewSection", isVRMode ? 200f : 180f).transform, "Preview", colThumbBg);
         preview.preserveAspect = true;
         StretchFull(preview.rectTransform, 0, 0, 0, 0);
 
-        GameObject detailsSection = CreateSection(detailContent.transform, "DetailsSection", 150f);
-        details = MakeText(detailsSection.transform, "Details", "请从左侧选择一个资源后执行操作。", 15, TextAnchor.UpperLeft, colTextDim);
+        // 详情区：固定高度 + 裁剪，禁止文字溢出叠到下方按钮
+        float detailsH = isVRMode ? 168f : 150f;
+        GameObject detailsSection = CreateSection(detailContent.transform, "DetailsSection", detailsH);
+        Image detailsBg = detailsSection.GetComponent<Image>();
+        if (detailsBg != null) {
+            detailsBg.color = new Color(0.14f, 0.16f, 0.20f, 1f);
+            detailsBg.raycastTarget = false;
+        }
+        // Unity UI Mask 裁剪子文字，避免“挤进”下方按钮
+        detailsSection.AddComponent<RectMask2D>();
+        details = MakeText(detailsSection.transform, "Details", "请从左侧选择一个资源后执行操作。", 14, TextAnchor.UpperLeft, colTextDim);
         details.horizontalOverflow = HorizontalWrapMode.Wrap;
-        details.verticalOverflow = VerticalWrapMode.Overflow;
-        StretchFull(details.rectTransform, 8, 8, 8, 8);
+        details.verticalOverflow = VerticalWrapMode.Truncate;
+        details.raycastTarget = false;
+        StretchFull(details.rectTransform, 10, 10, 8, 8);
 
         atomRowRoot = CreateRow(detailContent.transform, "AtomRow", 40f, 8, true);
         Button atomBtn = MakeButton(atomRowRoot.transform, "切换目标", 14, colBtn);
@@ -2248,7 +2259,10 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         SetFlexibleItem(loadScriptBtn.gameObject, 0f, 1f);
         loadScriptBtn.onClick.AddListener(() => LoadScriptToAtom());
 
-        linkActionRoot = CreateRow(detailContent.transform, "LinkActionRow", 42f, 8, true);
+        // 次要操作：更高按钮 + 更大间距，不与详情文字叠在一起
+        float actionH = isVRMode ? 52f : 48f;
+        int actionGap = isVRMode ? 10 : 8;
+        linkActionRoot = CreateRow(detailContent.transform, "LinkActionRow", actionH, actionGap, true);
         linkOnlyBtn = MakeButton(linkActionRoot.transform, "仅链接", 15, colBtn);
         SetFlexibleItem(linkOnlyBtn.gameObject, 0f, 1f);
         linkOnlyBtn.onClick.AddListener(() => LinkSelected(false));
@@ -2259,16 +2273,16 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         SetFlexibleItem(favToggleBtn.gameObject, 0f, 1f);
         favToggleBtn.onClick.AddListener(() => ToggleFavoriteSelected());
 
-        hubRowRoot = CreateRow(detailContent.transform, "HubRow", isVRMode ? 44f : 40f, 6, true);
-        Button hubDetailBtn = MakeButton(hubRowRoot.transform, "Hub", 14, colAccentDim);
+        hubRowRoot = CreateRow(detailContent.transform, "HubRow", actionH, actionGap, true);
+        Button hubDetailBtn = MakeButton(hubRowRoot.transform, "Hub", 15, colAccentDim);
         SetFlexibleItem(hubDetailBtn.gameObject, 0f, 1f);
         hubDetailBtn.onClick.AddListener(() => OpenSelectedInHub());
-        Button hubDepsBtn = MakeButton(hubRowRoot.transform, "检查依赖", 14, colBtn);
+        Button hubDepsBtn = MakeButton(hubRowRoot.transform, "检查依赖", 15, colBtn);
         SetFlexibleItem(hubDepsBtn.gameObject, 0f, 1f);
         hubDepsBtn.onClick.AddListener(() => CheckSelectedMissingDeps());
 
-        hubDownloadRoot = CreateRow(detailContent.transform, "HubDownloadRow", isVRMode ? 44f : 40f, 6, true);
-        hubDownloadButton = MakeButton(hubDownloadRoot.transform, missingDepsDownloadRunning ? "取消下载" : "下载缺失依赖", 14, colSuccess);
+        hubDownloadRoot = CreateRow(detailContent.transform, "HubDownloadRow", actionH, actionGap, true);
+        hubDownloadButton = MakeButton(hubDownloadRoot.transform, missingDepsDownloadRunning ? "取消下载" : "下载缺失依赖", 15, colSuccess);
         SetFlexibleItem(hubDownloadButton.gameObject, 0f, 1f);
         hubDownloadButton.onClick.AddListener(() => DownloadSelectedMissingDepsToLibrary());
 
@@ -4110,7 +4124,29 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
     }
 
     private string CatTextLabel(PackageLite p){ if(p==null||p.cats==null||p.cats.Count==0)return "其他"; List<string> labels=new List<string>(); for(int i=0;i<p.cats.Count;i++)labels.Add(CatLabel(p.cats[i])); return string.Join("，",labels.ToArray()); }
-    private void SelectPackage(PackageLite p){ selected=p; selectedPreset=null; selectedVarPreset=null; selectedSceneItem=null; selectedWearableItem=null; LoadPreview(p); if(details!=null){ details.text=p.uid+"\n\n分类："+CatTextLabel(p)+"\n路径："+p.relPath+"\n依赖："+p.deps.Count+" | 场景："+p.scenes.Count+"\n包内预设："+(p.presetSpecs==null?0:p.presetSpecs.Count)+"\n首场景："+(p.firstScene==""?"-":p.firstScene)+"\n收藏："+(IsFavorite(p)?"是":"否")+" | 默认保留："+(IsDefault(p)?"是":"否")+"\n\n"+OneLine(p.description,280); details.color=colTextSecondary; } UpdateAtomSelectorUI(); UpdateInspectorVisibility(); SetStatus("已选择 "+p.uid,false); }
+    private void SelectPackage(PackageLite p){
+        selected=p; selectedPreset=null; selectedVarPreset=null; selectedSceneItem=null; selectedWearableItem=null;
+        LoadPreview(p);
+        if(details!=null){
+            // 分行展示，避免一行过长；详情区会裁剪，不再叠到按钮上
+            StringBuilder sb = new StringBuilder();
+            sb.Append(p.uid).Append('\n');
+            sb.Append("分类：").Append(CatTextLabel(p)).Append('\n');
+            sb.Append("路径：").Append(OneLine(p.relPath, 72)).Append('\n');
+            sb.Append("依赖：").Append(p.deps.Count)
+              .Append("  场景：").Append(p.scenes.Count)
+              .Append("  预设：").Append(p.presetSpecs==null?0:p.presetSpecs.Count).Append('\n');
+            if (p.firstScene != "") sb.Append("首场景：").Append(OneLine(p.firstScene, 56)).Append('\n');
+            sb.Append("收藏：").Append(IsFavorite(p)?"是":"否")
+              .Append("  默认保留：").Append(IsDefault(p)?"是":"否");
+            if (!string.IsNullOrEmpty(p.description)) sb.Append('\n').Append(OneLine(p.description, 120));
+            details.text = sb.ToString();
+            details.color = colTextSecondary;
+        }
+        UpdateAtomSelectorUI();
+        UpdateInspectorVisibility();
+        SetStatus("已选择 "+p.uid, false);
+    }
     private void LoadPreview(PackageLite p){ ClearPreview(); if(preview==null||p==null)return; try{ Texture2D tex; Sprite sp; if(!TryLoadPackageSprite(p,12L*1024L*1024L,out tex,out sp)) return; previewTex=tex; previewSprite=sp; preview.sprite=previewSprite; preview.color=Color.white;}catch(Exception e){Logger.LogWarning(e.Message);ClearPreview();}}
     private bool TryLoadPackageSprite(PackageLite p,long maxBytes,out Texture2D tex,out Sprite sp){ tex=null; sp=null; try{ byte[] bytes=null; if(p!=null && p.thumbCache!="" && File.Exists(p.thumbCache)) bytes=File.ReadAllBytes(p.thumbCache); if(bytes==null && p!=null && p.thumbEntry!="") bytes=ReadBytes(p,p.thumbEntry,maxBytes); if(bytes==null||bytes.Length==0)return false; tex=new Texture2D(2,2,TextureFormat.RGBA32,false); if(!tex.LoadImage(bytes)){Destroy(tex);tex=null;return false;} sp=Sprite.Create(tex,new Rect(0,0,tex.width,tex.height),new Vector2(0.5f,0.5f)); return true;}catch(Exception e){Logger.LogWarning("TryLoadPackageSprite failed: "+e.Message); if(sp!=null)Destroy(sp); if(tex!=null)Destroy(tex); tex=null; sp=null; return false;}}
     private void StopThumbLoadCoroutine(){ if(thumbLoadCoroutine!=null){ try{ StopCoroutine(thumbLoadCoroutine); }catch{} thumbLoadCoroutine=null; } }
@@ -4566,15 +4602,28 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
     private Image Image(Transform parent,string name,Color color){ return MakeImage(parent,name,color); }
     private Image MakeImage(Transform parent,string name,Color color){ GameObject go=new GameObject(name); go.transform.SetParent(parent,false); Image i=go.AddComponent<Image>(); i.color=color; return i; }
     private Button Button(Transform parent,string label,int size){ return MakeButton(parent,label,size,colBtn); }
-    private Button MakeButton(Transform parent,string label,int size,Color bgColor){ GameObject go=new GameObject("Button"); go.transform.SetParent(parent,false); Image img=go.AddComponent<Image>(); img.color=bgColor; Button b=go.AddComponent<Button>(); b.targetGraphic=img; ColorBlock cb=b.colors; cb.normalColor=Color.white; cb.highlightedColor=new Color(1.2f,1.2f,1.2f,1f); cb.pressedColor=new Color(0.85f,0.85f,0.85f,1f); b.colors=cb; Text t=MakeText(go.transform,"Text",label,size,TextAnchor.MiddleCenter,colTextPrimary); RectTransform tr=t.rectTransform; tr.anchorMin=Vector2.zero; tr.anchorMax=Vector2.one; tr.offsetMin=new Vector2(4,2); tr.offsetMax=new Vector2(-4,-2); return b; }
+    private Button MakeButton(Transform parent,string label,int size,Color bgColor){
+        GameObject go=new GameObject("Button"); go.transform.SetParent(parent,false);
+        Image img=go.AddComponent<Image>();
+        // 强制不透明，避免下方/溢出文字透出造成“挤在一起”
+        Color c = bgColor; c.a = 1f; img.color = c;
+        Button b=go.AddComponent<Button>(); b.targetGraphic=img;
+        ColorBlock cb=b.colors; cb.normalColor=Color.white; cb.highlightedColor=new Color(1.12f,1.12f,1.12f,1f); cb.pressedColor=new Color(0.88f,0.88f,0.88f,1f); b.colors=cb;
+        Text t=MakeText(go.transform,"Text",label,size,TextAnchor.MiddleCenter,colTextPrimary);
+        t.raycastTarget=false;
+        RectTransform tr=t.rectTransform; tr.anchorMin=Vector2.zero; tr.anchorMax=Vector2.one; tr.offsetMin=new Vector2(6,4); tr.offsetMax=new Vector2(-6,-4);
+        return b;
+    }
     private GameObject CreateSection(Transform parent, string name, float preferredHeight) {
         GameObject go = new GameObject(name);
         go.transform.SetParent(parent, false);
         Image bg = go.AddComponent<Image>();
-        bg.color = new Color(1f, 1f, 1f, 0.06f);
+        bg.color = new Color(0.16f, 0.18f, 0.22f, 1f);
+        bg.raycastTarget = false;
         LayoutElement le = go.AddComponent<LayoutElement>();
         le.preferredHeight = preferredHeight;
         le.minHeight = preferredHeight;
+        le.flexibleHeight = 0f;
         return go;
     }
     private GameObject CreateStackSection(Transform parent, string name, int topBottomPadding, int spacing, float minHeight) {
@@ -4594,17 +4643,22 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
     private GameObject CreateRow(Transform parent, string name, float height, int spacing, bool padded) {
         GameObject go = new GameObject(name);
         go.transform.SetParent(parent, false);
+        // 不透明底，挡住上方溢出文字
+        Image rowBg = go.AddComponent<Image>();
+        rowBg.color = new Color(0.18f, 0.20f, 0.26f, 1f);
+        rowBg.raycastTarget = false;
         HorizontalLayoutGroup hlg = go.AddComponent<HorizontalLayoutGroup>();
         hlg.spacing = spacing;
-        hlg.padding = padded ? new RectOffset(0, 0, 0, 0) : new RectOffset();
+        hlg.padding = padded ? new RectOffset(2, 2, 2, 2) : new RectOffset(2, 2, 2, 2);
         hlg.childAlignment = TextAnchor.MiddleCenter;
         hlg.childControlWidth = true;
         hlg.childControlHeight = true;
-        hlg.childForceExpandWidth = false;
+        hlg.childForceExpandWidth = true;
         hlg.childForceExpandHeight = true;
         LayoutElement le = go.AddComponent<LayoutElement>();
         le.preferredHeight = height;
         le.minHeight = height;
+        le.flexibleHeight = 0f;
         return go;
     }
     private void SetFlexibleItem(GameObject go, float minWidth, float flexibleWidth) {
