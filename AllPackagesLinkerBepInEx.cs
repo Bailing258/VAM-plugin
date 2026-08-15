@@ -4,6 +4,8 @@ using System.Collections;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
+using System.Reflection;
+using System.Reflection.Emit;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -16,10 +18,11 @@ using SimpleJSON;
 using ICSharpCode.SharpZipLib.Zip;
 using MVR.FileManagement;
 using Valve.VR;
+using HarmonyLib;
 
-[BepInPlugin("local.vam.allpackageslinker", "AllPackagesLinker", "1.3.6")]
+[BepInPlugin("local.vam.allpackageslinker", "AllPackagesLinker", "1.3.7")]
 public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
-    private const string PluginVersion = "1.3.6";
+    private const string PluginVersion = "1.3.7";
     private const string TimelineConverterVersion = "timeline-optimized-v1";
     private const long MaxLargeSceneTextBytes = 1024L * 1024L * 1024L;
     private const string LinkRootName = "_AllPackagesLinkerLinks";
@@ -34,6 +37,8 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
     private const float SceneLoadProfileStableSeconds = 2.0f;
     private const float SceneLoadProfileNoLoadingGraceSeconds = 5.0f;
     private const float SceneLoadProfileTimeoutSeconds = 180.0f;
+    private const string TextureFinishHarmonyId = "local.vam.allpackageslinker.texture-finish";
+    private const int TextureFinishVanillaLimit = 4;
     private const int SYMBOLIC_LINK_FLAG_FILE = 0x0;
     private const int SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE = 0x2;
 
@@ -240,6 +245,11 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
     private bool scanAllPackagesOnStartup = false;
     private bool autoCleanLinksBeforeSceneLoad = false;
     private bool sceneTexturePrewarmEnabled = true;
+    private int textureFinishGear = 1; // 0=vanilla 4, 1=balanced 8, 2=fast 12, 3=extreme 16
+    private Harmony textureFinishHarmony = null;
+    private static AllPackagesLinkerBepInEx textureFinishOwner = null;
+    private static bool textureFinishPatchApplied = false;
+    private static int textureFinishTranspilerHits = 0;
     private int sceneLoadMode = 0; // 0=full, 1=primary, 2=minimal
     private string scenePrimaryPersonId = "";
     private SceneJsonAnalysis selectedSceneAnalysis = null;
@@ -329,6 +339,7 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
             if(font==null) font = (Font)Resources.GetBuiltinResource(typeof(Font), "Arial.ttf");
             DebugLog("Builtin font loaded=" + (font != null));
             LoadConfig();
+            InstallTextureFinishPatch();
             configuredDownloadRoot = missingDepsDownloadRoot;
             string linkedDownloadRoot = ResolveLinkedLibraryDownloadRoot(missingDepsDownloadRoot);
             if (!string.Equals(linkedDownloadRoot, missingDepsDownloadRoot, StringComparison.OrdinalIgnoreCase)) {
@@ -604,6 +615,7 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
 
     private void OnDestroy() {
         DebugLog("OnDestroy.");
+        UninstallTextureFinishPatch();
         missingDepsDownloadCancelRequested=true;
         StopActiveHubProcess();
         SaveMarks();
@@ -613,6 +625,94 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         CancelInvoke("TryDispatchSceneLoadAfterPrewarm");
         ExitVrRotationMode("destroy");
         ClosePanel();
+    }
+
+    private void InstallTextureFinishPatch() {
+        textureFinishOwner = this;
+        textureFinishPatchApplied = false;
+        textureFinishTranspilerHits = 0;
+        try {
+            MethodInfo target = AccessTools.Method(typeof(ImageLoaderThreaded), "PostProcessCompletedImages");
+            MethodInfo transpiler = AccessTools.Method(typeof(AllPackagesLinkerBepInEx), "TextureFinishTranspiler");
+            if (object.ReferenceEquals(target, null) || object.ReferenceEquals(transpiler, null)) throw new MissingMethodException("ImageLoaderThreaded.PostProcessCompletedImages or transpiler not found");
+            textureFinishHarmony = new Harmony(TextureFinishHarmonyId);
+            textureFinishHarmony.Patch(target, null, null, new HarmonyMethod(transpiler));
+            if (textureFinishTranspilerHits != 1) {
+                throw new InvalidOperationException("expected one texture finish loop limit, matched " + textureFinishTranspilerHits);
+            }
+            textureFinishPatchApplied = true;
+            DebugLog("Texture finish patch installed. gear=" + TextureFinishGearName(textureFinishGear) + ", loadingLimit=" + TextureFinishLimitForGear(textureFinishGear) + ", idleLimit=" + TextureFinishVanillaLimit);
+        } catch(Exception e) {
+            try { if (textureFinishHarmony != null) textureFinishHarmony.UnpatchAll(TextureFinishHarmonyId); } catch {}
+            textureFinishHarmony = null;
+            textureFinishPatchApplied = false;
+            Logger.LogWarning("Texture finish acceleration disabled; vanilla limit remains active: " + e.Message);
+            DebugLog("Texture finish patch failed: " + e.ToString());
+        }
+    }
+
+    private void UninstallTextureFinishPatch() {
+        try { if (textureFinishHarmony != null) textureFinishHarmony.UnpatchAll(TextureFinishHarmonyId); }
+        catch(Exception e) { Logger.LogWarning("Texture finish patch cleanup failed: " + e.Message); }
+        textureFinishHarmony = null;
+        textureFinishPatchApplied = false;
+        if (object.ReferenceEquals(textureFinishOwner, this)) textureFinishOwner = null;
+    }
+
+    private static IEnumerable<CodeInstruction> TextureFinishTranspiler(IEnumerable<CodeInstruction> instructions) {
+        List<CodeInstruction> codes = new List<CodeInstruction>(instructions);
+        int hits = 0;
+        int matchAt = -1;
+        for (int i = 1; i + 1 < codes.Count; i++) {
+            bool loopLocal = codes[i - 1].opcode == OpCodes.Ldloc_0;
+            bool vanillaLimit = codes[i].opcode == OpCodes.Ldc_I4_4;
+            bool loopBranch = codes[i + 1].opcode == OpCodes.Blt || codes[i + 1].opcode == OpCodes.Blt_S;
+            if (loopLocal && vanillaLimit && loopBranch) { hits++; matchAt = i; }
+        }
+        textureFinishTranspilerHits = hits;
+        if (hits == 1) {
+            MethodInfo limitMethod = AccessTools.Method(typeof(AllPackagesLinkerBepInEx), "TextureFinishLimitForCurrentFrame");
+            if (!object.ReferenceEquals(limitMethod, null)) {
+                codes[matchAt].opcode = OpCodes.Call;
+                codes[matchAt].operand = limitMethod;
+            } else {
+                textureFinishTranspilerHits = 0;
+            }
+        }
+        return codes;
+    }
+
+    private static int TextureFinishLimitForCurrentFrame() {
+        AllPackagesLinkerBepInEx owner = textureFinishOwner;
+        if (!textureFinishPatchApplied || owner == null || owner.textureFinishGear <= 0) return TextureFinishVanillaLimit;
+        SuperController sc = SuperController.singleton;
+        if (sc == null || !sc.isLoading) return TextureFinishVanillaLimit;
+        return TextureFinishLimitForGear(owner.textureFinishGear);
+    }
+
+    private static int TextureFinishLimitForGear(int gear) {
+        switch (Mathf.Clamp(gear, 0, 3)) {
+            case 1: return 8;
+            case 2: return 12;
+            case 3: return 16;
+            default: return TextureFinishVanillaLimit;
+        }
+    }
+
+    private static string TextureFinishGearName(int gear) {
+        switch (Mathf.Clamp(gear, 0, 3)) {
+            case 1: return "均衡";
+            case 2: return "高速";
+            case 3: return "极限";
+            default: return "原版";
+        }
+    }
+
+    private void SetTextureFinishGear(int gear) {
+        textureFinishGear = Mathf.Clamp(gear, 0, 3);
+        SaveConfig();
+        string patchState = textureFinishPatchApplied ? "已启用" : "补丁未生效，仍为原版 4";
+        SetStatus("纹理收尾挡位：" + TextureFinishGearName(textureFinishGear) + " " + TextureFinishLimitForGear(textureFinishGear) + "（" + patchState + "）", true);
     }
     private void StopActiveHubProcess() {
         Process p = activeHubProcess; activeHubProcess = null;
@@ -1470,15 +1570,27 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         scanSw.Stop();
         Stopwatch materializeSw = Stopwatch.StartNew();
         Dictionary<string, string> replacements = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        Dictionary<string, PackageLite> resolvedScriptPackages = new Dictionary<string, PackageLite>(StringComparer.OrdinalIgnoreCase);
+        Dictionary<string, string> resolvedScriptSources = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        HashSet<string> missingScriptPackages = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        HashSet<string> attemptedRefs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         for (int i = 0; i < occurrences.Count; i++) {
             SceneScriptRefOccurrence occurrence = occurrences[i];
             string fullRef = occurrence.fullRef;
-            if (replacements.ContainsKey(fullRef)) continue;
+            if (!attemptedRefs.Add(fullRef)) continue;
             PackageLite scriptPackage;
             string source;
-            if (!TryResolvePackageByUid(occurrence.uid, out scriptPackage, out source)) {
-                errors.Add("脚本包未找到：" + occurrence.uid);
-                continue;
+            if (!resolvedScriptPackages.TryGetValue(occurrence.uid, out scriptPackage)) {
+                if (missingScriptPackages.Contains(occurrence.uid)) continue;
+                if (!TryResolvePackageByUid(occurrence.uid, out scriptPackage, out source)) {
+                    missingScriptPackages.Add(occurrence.uid);
+                    errors.Add("脚本包未找到：" + occurrence.uid);
+                    continue;
+                }
+                resolvedScriptPackages[occurrence.uid] = scriptPackage;
+                resolvedScriptSources[occurrence.uid] = source;
+            } else {
+                resolvedScriptSources.TryGetValue(occurrence.uid, out source);
             }
             try {
                 bool materializedNow;
@@ -1685,6 +1797,7 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
                 if(k=="scanAllPackagesOnStartup") scanAllPackagesOnStartup=(v=="1" || v.Equals("true", StringComparison.OrdinalIgnoreCase));
                 if(k=="autoCleanLinksBeforeSceneLoad") autoCleanLinksBeforeSceneLoad=(v=="1" || v.Equals("true", StringComparison.OrdinalIgnoreCase));
                 if(k=="sceneTexturePrewarmEnabled") sceneTexturePrewarmEnabled=(v=="1" || v.Equals("true", StringComparison.OrdinalIgnoreCase));
+                if(k=="textureFinishGear" && int.TryParse(v,out iv)) textureFinishGear=Mathf.Clamp(iv,0,3);
                 if(k=="sceneLoadMode" && int.TryParse(v,out iv)) sceneLoadMode=Mathf.Clamp(iv,0,2);
                 if(k=="missingDepsDownloadRoot" && !string.IsNullOrEmpty(v)) missingDepsDownloadRoot=v;
                 if(k=="vrRotationEnabled") vrRotationEnabled=(v=="1" || v.Equals("true", StringComparison.OrdinalIgnoreCase));
@@ -1718,6 +1831,7 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
             sb.Append("scanAllPackagesOnStartup=").Append(scanAllPackagesOnStartup?"1":"0").Append('\n');
             sb.Append("autoCleanLinksBeforeSceneLoad=").Append(autoCleanLinksBeforeSceneLoad?"1":"0").Append('\n');
             sb.Append("sceneTexturePrewarmEnabled=").Append(sceneTexturePrewarmEnabled?"1":"0").Append('\n');
+            sb.Append("textureFinishGear=").Append(textureFinishGear).Append('\n');
             sb.Append("sceneLoadMode=").Append(sceneLoadMode).Append('\n');
             sb.Append("missingDepsDownloadRoot=").Append(missingDepsDownloadRoot).Append('\n');
             sb.Append("vrRotationEnabled=").Append(vrRotationEnabled?"1":"0").Append('\n');
@@ -6633,6 +6747,29 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
             if (v) StartSelectedScenePrewarm(); else StopScenePrewarm(true);
             SetStatus("场景皮肤预热：" + (v ? "开" : "关"), true);
         });
+
+        Text textureFinishTitle = MakeText(content.transform, "TextureFinishTitle", "纹理收尾（仅加载时）", 14, TextAnchor.MiddleLeft, colTextSecondary);
+        SetFixedHeight(textureFinishTitle.gameObject, 24f);
+        GameObject textureFinishRow = CreateRow(content.transform, "TextureFinishGear", isVRMode ? 46f : 40f, 6, true);
+        Button textureVanillaBtn = MakeButton(textureFinishRow.transform, "原版 4", 12, colBtn);
+        Button textureBalancedBtn = MakeButton(textureFinishRow.transform, "均衡 8", 12, colBtn);
+        Button textureFastBtn = MakeButton(textureFinishRow.transform, "高速 12", 12, colBtn);
+        Button textureExtremeBtn = MakeButton(textureFinishRow.transform, "极限 16", 12, colBtn);
+        SetFlexibleItem(textureVanillaBtn.gameObject, 0f, 1f);
+        SetFlexibleItem(textureBalancedBtn.gameObject, 0f, 1f);
+        SetFlexibleItem(textureFastBtn.gameObject, 0f, 1f);
+        SetFlexibleItem(textureExtremeBtn.gameObject, 0f, 1f);
+        UiAction refreshTextureGearColors = () => {
+            SetModeButtonColor(textureVanillaBtn, textureFinishGear == 0);
+            SetModeButtonColor(textureBalancedBtn, textureFinishGear == 1);
+            SetModeButtonColor(textureFastBtn, textureFinishGear == 2);
+            SetModeButtonColor(textureExtremeBtn, textureFinishGear == 3);
+        };
+        textureVanillaBtn.onClick.AddListener(() => { SetTextureFinishGear(0); refreshTextureGearColors(); });
+        textureBalancedBtn.onClick.AddListener(() => { SetTextureFinishGear(1); refreshTextureGearColors(); });
+        textureFastBtn.onClick.AddListener(() => { SetTextureFinishGear(2); refreshTextureGearColors(); });
+        textureExtremeBtn.onClick.AddListener(() => { SetTextureFinishGear(3); refreshTextureGearColors(); });
+        refreshTextureGearColors();
 
         // VR 镜头模式：桌面/VR 设置都可配，不依赖当前面板模式
         Text gVrRot = MakeText(content.transform, "GVrRot", "VR 镜头模式", 15, TextAnchor.MiddleLeft, colAccent);
