@@ -3,6 +3,7 @@ using System.IO;
 using System.Collections;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -16,15 +17,19 @@ using ICSharpCode.SharpZipLib.Zip;
 using MVR.FileManagement;
 using Valve.VR;
 
-[BepInPlugin("local.vam.allpackageslinker", "AllPackagesLinker", "1.2.7")]
+[BepInPlugin("local.vam.allpackageslinker", "AllPackagesLinker", "1.3.5")]
 public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
-    private const string PluginVersion = "1.2.7";
+    private const string PluginVersion = "1.3.5";
+    private const string TimelineConverterVersion = "timeline-optimized-v1";
+    private const long MaxLargeSceneTextBytes = 1024L * 1024L * 1024L;
     private const string LinkRootName = "_AllPackagesLinkerLinks";
     private const string CacheHeader = "#APL_INDEX_V2";
     private const string ListSep = "\u001f";
     private const string MissingDepsDownloadRootDefault = @"E:\VAM";
     private const string HubApiUrl = "https://hub.virtamate.com/citizenx/api.php";
     private const int MaxPendingVrOpenRetries = 40;
+    private const int MaxScenePrewarmTextures = 32;
+    private const float SceneLoadDispatchDelay = 0.10f;
     private const int SYMBOLIC_LINK_FLAG_FILE = 0x0;
     private const int SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE = 0x2;
 
@@ -78,6 +83,52 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         public Text iconText;
     }
 
+    private class SceneScriptRefOccurrence {
+        public int start, length;
+        public string fullRef="", uid="", scriptSuffix="";
+    }
+
+    private class SceneAtomSpan {
+        public int start, length;
+        public string id="", type="";
+    }
+
+    private class SceneJsonAnalysis {
+        public string key="", json="", error="";
+        public int atomsOpen=-1, atomsClose=-1;
+        public List<SceneAtomSpan> atoms = new List<SceneAtomSpan>();
+        public List<string> personIds = new List<string>();
+    }
+
+    private class SceneVariantResult {
+        public string primaryJson="", deferredJson="";
+        public int totalAtoms=0, keptAtoms=0, deferredAtoms=0;
+        public List<string> deferredTypes = new List<string>();
+    }
+
+    private class TimelinePropertySpan {
+        public string key="";
+        public int start, length;
+        public char kind;
+    }
+
+    private class TimelineObjectSpan {
+        public int start, length;
+    }
+
+    private class TimelineRewriteSpan {
+        public int start, length;
+        public bool animationHeader;
+    }
+
+    private class TimelineOptimizationInfo {
+        public bool cacheHit, optimized;
+        public int animations, curves;
+        public long keyframes, sourceBytes, outputBytes;
+        public double readMs, optimizeMs, cacheReadMs;
+        public string cachePath="", error="";
+    }
+
     private class SceneLite {
         public PackageLite package;
         public string entryPath="", name="";
@@ -108,7 +159,7 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
     private Dictionary<string, PackageLite> addonLatest = new Dictionary<string, PackageLite>(StringComparer.OrdinalIgnoreCase);
     private Dictionary<string, string> materializedScriptRoots = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
-    private Canvas canvas; private GameObject root, confirmRoot, subBarRoot, pageStripRoot; private Transform listContent; private Text header, details, statusText, downloadProgressText; private Image preview, downloadProgressFill;
+    private Canvas canvas; private GameObject root, confirmRoot, subBarRoot, pageStripRoot, authorDropdownRoot; private Transform listContent, authorDropdownContent; private Text header, details, statusText, downloadProgressText; private Image preview, downloadProgressFill;
     private Sprite previewSprite; private Texture2D previewTex; private Font font;
     private List<Sprite> listThumbSprites = new List<Sprite>();
     private List<Texture2D> listThumbTextures = new List<Texture2D>();
@@ -116,17 +167,21 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
     private List<Image> tabBgs = new List<Image>();
     private string[] tabCats;
     private string searchQuery = "";
+    // "All" is the sentinel.  A VAR package uid is normally Author.Package.Version.
+    private string authorFilter = "All";
     private InputField searchInput;
+    private InputField authorDropdownSearchInput;
     // UI refactor refs (plan.md)
     private GameObject navRoot, settingsDrawerRoot, settingsBackdropRoot, emptyStateRoot;
-    private GameObject atomRowRoot, presetOptionsRoot, presetModeRoot, presetActionRoot, sceneActionRoot, linkActionRoot, hubRowRoot, hubDownloadRoot, progressSectionRoot, dangerRowRoot, moreActionsRoot;
+    private GameObject atomRowRoot, presetOptionsRoot, presetModeRoot, presetActionRoot, sceneModeRoot, scenePersonRoot, sceneActionRoot, linkActionRoot, hubRowRoot, hubDownloadRoot, progressSectionRoot, dangerRowRoot, moreActionsRoot;
     private Text resultCountText, pageInfoText, searchPlaceholderText;
     private Button settingsBtn, rescanTopBtn, searchClearBtn;
-    private Button loadSceneBtn, applyPresetBtn, loadScriptBtn, linkOnlyBtn, defaultKeepBtn, favToggleBtn;
+    private Button loadSceneBtn, loadDeferredSceneBtn, sceneFullModeBtn, scenePrimaryModeBtn, sceneMinimalModeBtn, applyPresetBtn, loadScriptBtn, linkOnlyBtn, defaultKeepBtn, favToggleBtn;
     private bool settingsDrawerOpen = false;
     private string allSubFilter = "All";
     private string targetAtomUid = "";
     private Text atomSelectorLabel;
+    private Text scenePrimaryPersonLabel;
     private bool applyClothing = true;
     // 人物外观预设默认带头发；仅当用户显式关闭“包含头发”时才锁定头发
     private bool applyHair = true;
@@ -145,9 +200,42 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
     private float uiYOffset = -0.04f;
     private bool autoOpenPanelInEditMode = false;
     private bool autoOpenPanelOnPluginLoad = false;
+    // This is deliberately separate from the option above: that option opens this
+    // plugin's library UI when BepInEx loads, while this one opens VaM's native
+    // target-atom Plugins UI after a script has been added to an atom.
+    private bool autoOpenTargetAtomPluginPanel = true;
+    private int autoOpenRetryCount = 0;
+    private const int MaxAutoOpenRetries = 20;
+    private string pendingPluginPanelAtomUid = "";
+    private string pendingPluginPanelSlotUid = "";
+    private int pendingPluginPanelRetryCount = 0;
+    private const int MaxPendingPluginPanelRetries = 30;
     private bool autoAllowAllPlugins = false;
+    // VR look mode (Left Stick Click toggle): stick X = yaw, stick Y = height
+    private bool vrRotationEnabled = true;
+    private float vrRotationSensitivity = 60f;
+    private float vrHeightSpeed = 0.90f; // meters/sec when stick fully pushed
+    private float vrRotationDeadzone = 0.18f;
+    private bool vrRotationInvert = false;
+    private bool vrHeightInvert = false;
+    private float vrRotationSnapAngle = 0f;
+    private float vrRotationSmoothing = 0.10f;
     private bool scanAllPackagesOnStartup = false;
     private bool autoCleanLinksBeforeSceneLoad = false;
+    private bool sceneTexturePrewarmEnabled = true;
+    private int sceneLoadMode = 0; // 0=full, 1=primary, 2=minimal
+    private string scenePrimaryPersonId = "";
+    private SceneJsonAnalysis selectedSceneAnalysis = null;
+    private Coroutine scenePrewarmCoroutine = null;
+    private int scenePrewarmGeneration = 0;
+    private int scenePrewarmPending = 0;
+    private int scenePrewarmErrors = 0;
+    private string scenePrewarmKey = "";
+    private HashSet<string> activePrewarmSignatures = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    private List<ImageLoaderThreaded.QueuedImage> activePrewarmImages = new List<ImageLoaderThreaded.QueuedImage>();
+    private string pendingDeferredScenePath = "";
+    private int pendingDeferredAtomCount = 0;
+    private float scenePrewarmWaitUntil = 0f;
     private string missingDepsDownloadRoot = MissingDepsDownloadRootDefault;
     private string configuredDownloadRoot = MissingDepsDownloadRootDefault;
     private bool missingDepsDownloadRunning = false;
@@ -171,6 +259,15 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
     // Latch the toggle until every controller button is released so the menu
     // cannot close/open again during a single physical gesture.
     private bool vrComboLatched = false;
+    private bool vrRotationModeActive = false;
+    private bool leftStickClickHeldLastFrame = false;
+    private float vrRotationFilteredX = 0f;
+    private float vrRotationFilteredY = 0f;
+    private float pendingVrYaw = 0f;
+    private float pendingVrHeight = 0f;
+    private bool vrSnapArmed = true;
+    private string lastVrRotationDiag = "";
+    private float nextVrRotationQuietDiagAt = 0f;
 
     // Clean high-contrast dark theme (desktop + VR readable)
     private static readonly Color colBg = new Color(0.14f, 0.16f, 0.20f, 0.96f);
@@ -240,9 +337,10 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
                 SetStatus("已加载缓存：" + cached + " 个包，" + localPresets.Count + " 个本地预设。已跳过启动全库扫描，需要更新库时点“重新扫描”。", true);
                 DebugLog("Startup full scan skipped by config.");
             }
+            autoOpenRetryCount = 0;
             Invoke("TryAutoOpenPanelOnPluginLoad", 2.0f);
             Invoke("TryAutoOpenPanelInEditMode", 2.5f);
-            DebugLog("Awake end. Delayed startup scan scheduled.");
+            DebugLog("Awake end. Delayed startup scan scheduled. autoOpenOnLoad=" + autoOpenPanelOnPluginLoad + ", vrRotation=" + vrRotationEnabled);
         } catch(Exception e) {
             DebugLog("Awake FAILED: " + e.ToString());
             Logger.LogError(e);
@@ -306,9 +404,18 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
                 TogglePanel();
             }
             lastCombo = combo;
+            UpdateVrRotationInput();
         } catch(Exception e) {
             DebugLog("Update FAILED: " + e.ToString());
             Logger.LogError(e);
+        }
+    }
+
+    private void LateUpdate() {
+        try {
+            ApplyPendingVrYaw();
+        } catch(Exception e) {
+            DebugLog("LateUpdate FAILED: " + e.ToString());
         }
     }
 
@@ -343,6 +450,16 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
     private bool SteamBool(SteamVR_Action_Boolean action, SteamVR_Input_Sources source) {
         try { return action != null && action.GetState(source); }
         catch { return false; }
+    }
+
+    private bool SteamBoolDown(SteamVR_Action_Boolean action, SteamVR_Input_Sources source) {
+        try { return action != null && action.GetStateDown(source); }
+        catch { return false; }
+    }
+
+    private Vector2 SteamAxis(SteamVR_Action_Vector2 action, SteamVR_Input_Sources source) {
+        try { return action != null ? action.GetAxis(source) : Vector2.zero; }
+        catch { return Vector2.zero; }
     }
 
     private bool HasActiveVrButton(string steamDiag, string openvrDiag) {
@@ -467,7 +584,18 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         } catch {}
     }
 
-    private void OnDestroy() { DebugLog("OnDestroy."); missingDepsDownloadCancelRequested=true; StopActiveHubProcess(); SaveMarks(); ClosePanel(); }
+    private void OnDestroy() {
+        DebugLog("OnDestroy.");
+        missingDepsDownloadCancelRequested=true;
+        StopActiveHubProcess();
+        SaveMarks();
+        StopScenePrewarm(true);
+        CancelInvoke("DoDelayedSceneLoad");
+        CancelInvoke("TryOpenTargetAtomPluginPanel");
+        CancelInvoke("TryDispatchSceneLoadAfterPrewarm");
+        ExitVrRotationMode("destroy");
+        ClosePanel();
+    }
     private void StopActiveHubProcess() {
         Process p = activeHubProcess; activeHubProcess = null;
         try { if (p != null && !p.HasExited) p.Kill(); } catch {}
@@ -528,18 +656,51 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
     }
     private void TryAutoOpenPanelOnPluginLoad() {
         try {
-            if (!autoOpenPanelOnPluginLoad) return;
-            if (canvas != null) return;
-            if (SuperController.singleton == null) {
-                Invoke("TryAutoOpenPanelOnPluginLoad", 1.0f);
+            if (!autoOpenPanelOnPluginLoad) {
+                DebugLog("TryAutoOpenPanelOnPluginLoad skipped: config off.");
                 return;
             }
-            // Prefer desktop overlay for auto-open reliability; VR users can use gesture.
-            openedViaVR = false;
-            DebugLog("Auto opening panel after plugin load.");
+            if (canvas != null) {
+                DebugLog("TryAutoOpenPanelOnPluginLoad skipped: panel already open.");
+                return;
+            }
+            if (SuperController.singleton == null) {
+                if (autoOpenRetryCount < MaxAutoOpenRetries) {
+                    autoOpenRetryCount++;
+                    DebugLog("TryAutoOpenPanelOnPluginLoad wait SuperController. retry=" + autoOpenRetryCount + "/" + MaxAutoOpenRetries);
+                    Invoke("TryAutoOpenPanelOnPluginLoad", 1.0f);
+                } else {
+                    DebugLog("TryAutoOpenPanelOnPluginLoad give up: SuperController never ready.");
+                }
+                return;
+            }
+            // In VR, open as world-space panel so the headset can see it.
+            // Desktop overlay is invisible inside the HMD (previous bug).
+            bool vrActive = IsVrSessionActive();
+            openedViaVR = vrActive;
+            if (vrActive && !CanPlaceVrCanvas()) {
+                if (autoOpenRetryCount < MaxAutoOpenRetries) {
+                    autoOpenRetryCount++;
+                    DebugLog("TryAutoOpenPanelOnPluginLoad wait VR view. retry=" + autoOpenRetryCount + "/" + MaxAutoOpenRetries);
+                    Invoke("TryAutoOpenPanelOnPluginLoad", 0.75f);
+                    return;
+                }
+                DebugLog("TryAutoOpenPanelOnPluginLoad VR view timeout; desktop overlay fallback.");
+                openedViaVR = false;
+            }
+            DebugLog("Auto opening panel after plugin load. vr=" + openedViaVR + ", isVrSession=" + vrActive + ", canPlace=" + CanPlaceVrCanvas());
             OpenPanel();
+            if (canvas == null && autoOpenRetryCount < MaxAutoOpenRetries) {
+                autoOpenRetryCount++;
+                DebugLog("TryAutoOpenPanelOnPluginLoad OpenPanel left canvas null; retry=" + autoOpenRetryCount);
+                Invoke("TryAutoOpenPanelOnPluginLoad", 1.0f);
+            }
         } catch(Exception e) {
             DebugLog("TryAutoOpenPanelOnPluginLoad FAILED: " + e.ToString());
+            if (autoOpenRetryCount < MaxAutoOpenRetries) {
+                autoOpenRetryCount++;
+                try { Invoke("TryAutoOpenPanelOnPluginLoad", 1.0f); } catch {}
+            }
         }
     }
     private void TryAutoOpenPanelInEditMode() {
@@ -1162,6 +1323,12 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
     }
 
     private string MaterializePackageScriptEntryToLocal(PackageLite p, string entryPath) {
+        bool ignored;
+        return MaterializePackageScriptEntryToLocal(p, entryPath, out ignored);
+    }
+
+    private string MaterializePackageScriptEntryToLocal(PackageLite p, string entryPath, out bool materializedNow) {
+        materializedNow = false;
         if (p == null) throw new Exception("包为空");
         string entry = Norm(entryPath);
         if (string.IsNullOrEmpty(entry)) throw new Exception("包内脚本条目为空");
@@ -1186,6 +1353,7 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
             SafeRecreateDirectoryUnder(Path.Combine(vamRoot, "Custom\\Scripts\\_AllPackagesLinkerTemp"), tempRoot);
             ExtractPackageScriptsToDirectory(p, tempRoot);
             File.WriteAllText(markerPath, markerValue, Encoding.UTF8);
+            materializedNow = true;
         } else if (validOnDisk && string.IsNullOrEmpty(cachedRoot)) {
             DebugLog("MaterializePackageScriptEntryToLocal reused disk cache: " + p.uid + " -> " + tempRoot);
         }
@@ -1196,6 +1364,7 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
             SafeRecreateDirectoryUnder(Path.Combine(vamRoot, "Custom\\Scripts\\_AllPackagesLinkerTemp"), tempRoot);
             ExtractPackageScriptsToDirectory(p, tempRoot);
             File.WriteAllText(markerPath, markerValue, Encoding.UTF8);
+            materializedNow = true;
         }
         if (!File.Exists(localFull)) throw new Exception("本地化脚本失败：" + p.uid + ":/" + entry + " -> " + localFull);
         string localRel = "Custom/Scripts/_AllPackagesLinkerTemp/" + safeUid + "/" + suffix.Replace('\\','/');
@@ -1273,50 +1442,48 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         return false;
     }
 
-    private string MaterializeSceneWithLocalScripts(PackageLite scenePackage, string sceneEntry, string sceneJson, out int replaced, out List<string> errors) {
+    private string MaterializeSceneWithLocalScripts(PackageLite scenePackage, string sceneEntry, string sceneJson, out int replaced, out List<string> errors, out bool scriptsChanged) {
         replaced = 0;
+        scriptsChanged = false;
         errors = new List<string>();
         if (string.IsNullOrEmpty(sceneJson)) return "";
-        Regex rx = new Regex("(?<uid>[^\"\\r\\n]+?):/Custom/Scripts/(?<path>[^\"\\r\\n]+)", RegexOptions.IgnoreCase);
+        Stopwatch scanSw = Stopwatch.StartNew();
+        List<SceneScriptRefOccurrence> occurrences = FindSceneScriptRefs(sceneJson);
+        scanSw.Stop();
+        Stopwatch materializeSw = Stopwatch.StartNew();
         Dictionary<string, string> replacements = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        MatchCollection matches = rx.Matches(sceneJson);
-        for (int i = 0; i < matches.Count; i++) {
-            Match m = matches[i];
-            if (!m.Success) continue;
-            string fullRef = m.Value;
+        for (int i = 0; i < occurrences.Count; i++) {
+            SceneScriptRefOccurrence occurrence = occurrences[i];
+            string fullRef = occurrence.fullRef;
             if (replacements.ContainsKey(fullRef)) continue;
-            string uid = (m.Groups["uid"].Value ?? "").Trim();
-            string scriptSuffix = (m.Groups["path"].Value ?? "").Trim();
-            if (uid.Length == 0 || scriptSuffix.Length == 0) continue;
-            int dots = 0; for (int d = 0; d < uid.Length; d++) if (uid[d] == '.') dots++;
-            if (dots < 2) continue;
             PackageLite scriptPackage;
             string source;
-            if (!TryResolvePackageByUid(uid, out scriptPackage, out source)) {
-                errors.Add("脚本包未找到：" + uid);
+            if (!TryResolvePackageByUid(occurrence.uid, out scriptPackage, out source)) {
+                errors.Add("脚本包未找到：" + occurrence.uid);
                 continue;
             }
             try {
-                string localRef = MaterializePackageScriptEntryToLocal(scriptPackage, "Custom/Scripts/" + scriptSuffix);
+                bool materializedNow;
+                string localRef = MaterializePackageScriptEntryToLocal(scriptPackage, "Custom/Scripts/" + occurrence.scriptSuffix, out materializedNow);
+                if (materializedNow) scriptsChanged = true;
                 replacements[fullRef] = localRef;
                 DebugLog("Scene script ref localized: " + fullRef + " -> " + localRef + " via " + source);
             } catch(Exception e) {
-                errors.Add(uid + ":/" + scriptSuffix + " -> " + e.Message);
+                errors.Add(occurrence.uid + ":/" + occurrence.scriptSuffix + " -> " + e.Message);
             }
         }
-        string rewritten = rx.Replace(sceneJson, delegate(Match m) {
-            string v = m.Value;
-            string r;
-            if (replacements.TryGetValue(v, out r)) return r;
-            return v;
-        });
-        int selfRefs = 0;
-        if (scenePackage != null && !string.IsNullOrEmpty(scenePackage.uid)) {
-            Regex selfRx = new Regex("SELF:/", RegexOptions.IgnoreCase);
-            selfRefs = selfRx.Matches(rewritten).Count;
-            if (selfRefs > 0) rewritten = selfRx.Replace(rewritten, scenePackage.uid + ":/");
+        materializeSw.Stop();
+        bool hasSelfRefs = scenePackage != null && !string.IsNullOrEmpty(scenePackage.uid)
+            && sceneJson.IndexOf("SELF:/", StringComparison.OrdinalIgnoreCase) >= 0;
+        if (replacements.Count == 0 && !hasSelfRefs) {
+            DebugLog("MaterializeSceneWithLocalScripts skipped. scanMs=" + scanSw.Elapsed.TotalMilliseconds.ToString("0") + ", refs=" + occurrences.Count);
+            return "";
         }
-        if (replacements.Count == 0 && selfRefs == 0) return "";
+        Stopwatch rewriteSw = Stopwatch.StartNew();
+        int selfRefs = 0;
+        string selfReplacement = hasSelfRefs ? scenePackage.uid + ":/" : null;
+        string rewritten = RewriteSceneReferences(sceneJson, occurrences, replacements, selfReplacement, out selfRefs);
+        rewriteSw.Stop();
         replaced = replacements.Count + selfRefs;
         string dir = Path.Combine(vamRoot, "Saves\\scene\\_AllPackagesLinkerTempScenes");
         Directory.CreateDirectory(dir);
@@ -1324,10 +1491,78 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         if (string.IsNullOrEmpty(name)) name = "scene.json";
         if (!name.EndsWith(".json", StringComparison.OrdinalIgnoreCase)) name += ".json";
         string outPath = Path.Combine(dir, name);
+        Stopwatch writeSw = Stopwatch.StartNew();
         File.WriteAllText(outPath, rewritten, Encoding.UTF8);
+        writeSw.Stop();
         string rel = Norm(MakeRel(vamRoot, outPath));
-        DebugLog("MaterializeSceneWithLocalScripts OK: scene=" + (scenePackage == null ? "" : scenePackage.uid) + ":/" + sceneEntry + ", scriptRefs=" + replacements.Count + ", selfRefs=" + selfRefs + ", replaced=" + replaced + ", out=" + rel + ", errors=" + errors.Count);
+        DebugLog("MaterializeSceneWithLocalScripts OK: scene=" + (scenePackage == null ? "" : scenePackage.uid) + ":/" + sceneEntry + ", scriptRefs=" + replacements.Count + ", selfRefs=" + selfRefs + ", replaced=" + replaced + ", out=" + rel + ", errors=" + errors.Count + ", scanMs=" + scanSw.Elapsed.TotalMilliseconds.ToString("0") + ", materializeMs=" + materializeSw.Elapsed.TotalMilliseconds.ToString("0") + ", rewriteMs=" + rewriteSw.Elapsed.TotalMilliseconds.ToString("0") + ", writeMs=" + writeSw.Elapsed.TotalMilliseconds.ToString("0"));
         return rel;
+    }
+
+    private List<SceneScriptRefOccurrence> FindSceneScriptRefs(string sceneJson) {
+        const string marker = ":/Custom/Scripts/";
+        List<SceneScriptRefOccurrence> result = new List<SceneScriptRefOccurrence>();
+        int searchAt = 0;
+        while (searchAt < sceneJson.Length) {
+            int markerAt = sceneJson.IndexOf(marker, searchAt, StringComparison.OrdinalIgnoreCase);
+            if (markerAt < 0) break;
+            int start = markerAt - 1;
+            while (start >= 0 && sceneJson[start] != '"' && sceneJson[start] != '\r' && sceneJson[start] != '\n') start--;
+            start++;
+            int end = markerAt + marker.Length;
+            while (end < sceneJson.Length && sceneJson[end] != '"' && sceneJson[end] != '\r' && sceneJson[end] != '\n') end++;
+            string uid = start < markerAt ? sceneJson.Substring(start, markerAt - start).Trim() : "";
+            string scriptSuffix = end > markerAt + marker.Length ? sceneJson.Substring(markerAt + marker.Length, end - markerAt - marker.Length).Trim() : "";
+            int dots = 0;
+            for (int d = 0; d < uid.Length; d++) if (uid[d] == '.') dots++;
+            if (dots >= 2 && uid.Length > 0 && scriptSuffix.Length > 0) {
+                SceneScriptRefOccurrence occurrence = new SceneScriptRefOccurrence();
+                occurrence.start = start;
+                occurrence.length = end - start;
+                occurrence.fullRef = sceneJson.Substring(start, end - start);
+                occurrence.uid = uid;
+                occurrence.scriptSuffix = scriptSuffix;
+                result.Add(occurrence);
+            }
+            searchAt = Math.Max(end, markerAt + marker.Length);
+        }
+        return result;
+    }
+
+    private string RewriteSceneReferences(string sceneJson, List<SceneScriptRefOccurrence> occurrences, Dictionary<string, string> replacements, string selfReplacement, out int selfRefs) {
+        StringBuilder sb = new StringBuilder(sceneJson.Length);
+        selfRefs = 0;
+        int cursor = 0;
+        for (int i = 0; i < occurrences.Count; i++) {
+            SceneScriptRefOccurrence occurrence = occurrences[i];
+            if (occurrence.start < cursor) continue;
+            AppendSceneSegment(sb, sceneJson, cursor, occurrence.start, selfReplacement, ref selfRefs);
+            string localRef;
+            if (replacements.TryGetValue(occurrence.fullRef, out localRef)) sb.Append(localRef);
+            else sb.Append(sceneJson, occurrence.start, occurrence.length);
+            cursor = occurrence.start + occurrence.length;
+        }
+        AppendSceneSegment(sb, sceneJson, cursor, sceneJson.Length, selfReplacement, ref selfRefs);
+        return sb.ToString();
+    }
+
+    private void AppendSceneSegment(StringBuilder sb, string source, int start, int end, string selfReplacement, ref int selfRefs) {
+        if (start >= end) return;
+        if (string.IsNullOrEmpty(selfReplacement)) {
+            sb.Append(source, start, end - start);
+            return;
+        }
+        const string selfMarker = "SELF:/";
+        int cursor = start;
+        while (cursor < end) {
+            int found = source.IndexOf(selfMarker, cursor, end - cursor, StringComparison.OrdinalIgnoreCase);
+            if (found < 0) break;
+            sb.Append(source, cursor, found - cursor);
+            sb.Append(selfReplacement);
+            selfRefs++;
+            cursor = found + selfMarker.Length;
+        }
+        sb.Append(source, cursor, end - cursor);
     }
 
     private string GetLocalPresetStoreDir(string presetType) {
@@ -1374,18 +1609,21 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         pendingVrOpenRetries = 0;
         vrCanvasWaitingForPlacement = false;
         StopThumbLoadCoroutine();
+        StopScenePrewarm(true);
         ClearPreview();
         ClearListThumbs();
+        if (authorDropdownRoot != null) Destroy(authorDropdownRoot);
         if (canvas != null && SuperController.singleton != null) { try { SuperController.singleton.RemoveCanvas(canvas); } catch {} }
         if (root != null) Destroy(root);
-        canvas=null; root=null; confirmRoot=null; subBarRoot=null; pageStripRoot=null; listContent=null; header=null; details=null; preview=null; statusText=null; downloadProgressText=null; downloadProgressFill=null; hubDownloadButton=null; applyClothingToggle=null; applyHairToggle=null; searchInput=null; atomSelectorLabel=null;
+        canvas=null; root=null; confirmRoot=null; subBarRoot=null; pageStripRoot=null; authorDropdownRoot=null; listContent=null; authorDropdownContent=null; header=null; details=null; preview=null; statusText=null; downloadProgressText=null; downloadProgressFill=null; hubDownloadButton=null; applyClothingToggle=null; applyHairToggle=null; searchInput=null; authorDropdownSearchInput=null; atomSelectorLabel=null; scenePrimaryPersonLabel=null;
         navRoot=null; settingsDrawerRoot=null; settingsBackdropRoot=null; emptyStateRoot=null;
-        atomRowRoot=null; presetOptionsRoot=null; presetModeRoot=null; presetActionRoot=null; sceneActionRoot=null; linkActionRoot=null; hubRowRoot=null; hubDownloadRoot=null; progressSectionRoot=null; dangerRowRoot=null; moreActionsRoot=null;
+        atomRowRoot=null; presetOptionsRoot=null; presetModeRoot=null; presetActionRoot=null; sceneModeRoot=null; scenePersonRoot=null; sceneActionRoot=null; linkActionRoot=null; hubRowRoot=null; hubDownloadRoot=null; progressSectionRoot=null; dangerRowRoot=null; moreActionsRoot=null;
         resultCountText=null; pageInfoText=null; searchPlaceholderText=null;
         settingsBtn=null; rescanTopBtn=null; searchClearBtn=null;
-        loadSceneBtn=null; applyPresetBtn=null; loadScriptBtn=null; linkOnlyBtn=null; defaultKeepBtn=null; favToggleBtn=null;
+        loadSceneBtn=null; loadDeferredSceneBtn=null; sceneFullModeBtn=null; scenePrimaryModeBtn=null; sceneMinimalModeBtn=null; applyPresetBtn=null; loadScriptBtn=null; linkOnlyBtn=null; defaultKeepBtn=null; favToggleBtn=null;
         settingsDrawerOpen=false;
         selectedPreset=null; selectedVarPreset=null; selectedSceneItem=null; selectedWearableItem=null; selected=null;
+        selectedSceneAnalysis=null;
         tabBgs.Clear();
         favSubBtns.Clear();
         if (isVRMode && pageSizeBeforeVr > 0) { pageSize = pageSizeBeforeVr; pageSizeBeforeVr = 0; SaveConfig(); }
@@ -1420,13 +1658,25 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
                 if(k=="uiYOffset" && float.TryParse(v,out f)) uiYOffset=Mathf.Clamp(f,-0.40f,0.30f);
                 if(k=="pageSize" && int.TryParse(v,out iv)) pageSize=Mathf.Clamp(iv,8,500);
                 if(k=="page" && int.TryParse(v,out iv)) page=Mathf.Max(0, iv);
+                if(k=="authorFilter" && !string.IsNullOrEmpty(v)) authorFilter=v;
                 if(k.StartsWith("tabPage:", StringComparison.OrdinalIgnoreCase) && int.TryParse(v,out iv)) tabPages[k.Substring(8)] = Mathf.Max(0, iv);
                 if(k=="autoOpenPanelInEditMode") autoOpenPanelInEditMode=(v=="1" || v.Equals("true", StringComparison.OrdinalIgnoreCase));
                 if(k=="autoOpenPanelOnPluginLoad") autoOpenPanelOnPluginLoad=(v=="1" || v.Equals("true", StringComparison.OrdinalIgnoreCase));
+                if(k=="autoOpenTargetAtomPluginPanel") autoOpenTargetAtomPluginPanel=(v=="1" || v.Equals("true", StringComparison.OrdinalIgnoreCase));
                 if(k=="autoAllowAllPlugins") autoAllowAllPlugins=(v=="1" || v.Equals("true", StringComparison.OrdinalIgnoreCase));
                 if(k=="scanAllPackagesOnStartup") scanAllPackagesOnStartup=(v=="1" || v.Equals("true", StringComparison.OrdinalIgnoreCase));
                 if(k=="autoCleanLinksBeforeSceneLoad") autoCleanLinksBeforeSceneLoad=(v=="1" || v.Equals("true", StringComparison.OrdinalIgnoreCase));
+                if(k=="sceneTexturePrewarmEnabled") sceneTexturePrewarmEnabled=(v=="1" || v.Equals("true", StringComparison.OrdinalIgnoreCase));
+                if(k=="sceneLoadMode" && int.TryParse(v,out iv)) sceneLoadMode=Mathf.Clamp(iv,0,2);
                 if(k=="missingDepsDownloadRoot" && !string.IsNullOrEmpty(v)) missingDepsDownloadRoot=v;
+                if(k=="vrRotationEnabled") vrRotationEnabled=(v=="1" || v.Equals("true", StringComparison.OrdinalIgnoreCase));
+                if(k=="vrRotationSensitivity" && float.TryParse(v,out f)) vrRotationSensitivity=Mathf.Clamp(f,10f,180f);
+                if(k=="vrHeightSpeed" && float.TryParse(v,out f)) vrHeightSpeed=Mathf.Clamp(f,0.10f,3.00f);
+                if(k=="vrRotationDeadzone" && float.TryParse(v,out f)) vrRotationDeadzone=Mathf.Clamp(f,0.05f,0.50f);
+                if(k=="vrRotationInvert") vrRotationInvert=(v=="1" || v.Equals("true", StringComparison.OrdinalIgnoreCase));
+                if(k=="vrHeightInvert") vrHeightInvert=(v=="1" || v.Equals("true", StringComparison.OrdinalIgnoreCase));
+                if(k=="vrRotationSnapAngle" && float.TryParse(v,out f)) vrRotationSnapAngle=Mathf.Clamp(f,0f,90f);
+                if(k=="vrRotationSmoothing" && float.TryParse(v,out f)) vrRotationSmoothing=Mathf.Clamp(f,0f,0.40f);
             }
         } catch(Exception e) { Logger.LogWarning("LoadConfig failed: "+e.Message); }
     }
@@ -1439,15 +1689,27 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
             sb.Append("uiYOffset=").Append(uiYOffset.ToString("R")).Append('\n');
             sb.Append("pageSize=").Append(pageSize).Append('\n');
             sb.Append("page=").Append(page).Append('\n');
+            sb.Append("authorFilter=").Append(authorFilter ?? "All").Append('\n');
             List<string> keys = new List<string>(tabPages.Keys);
             keys.Sort(StringComparer.OrdinalIgnoreCase);
             for (int i = 0; i < keys.Count; i++) sb.Append("tabPage:").Append(keys[i]).Append('=').Append(Mathf.Max(0, tabPages[keys[i]])).Append('\n');
             sb.Append("autoOpenPanelInEditMode=").Append(autoOpenPanelInEditMode?"1":"0").Append('\n');
             sb.Append("autoOpenPanelOnPluginLoad=").Append(autoOpenPanelOnPluginLoad?"1":"0").Append('\n');
+            sb.Append("autoOpenTargetAtomPluginPanel=").Append(autoOpenTargetAtomPluginPanel?"1":"0").Append('\n');
             sb.Append("autoAllowAllPlugins=").Append(autoAllowAllPlugins?"1":"0").Append('\n');
             sb.Append("scanAllPackagesOnStartup=").Append(scanAllPackagesOnStartup?"1":"0").Append('\n');
             sb.Append("autoCleanLinksBeforeSceneLoad=").Append(autoCleanLinksBeforeSceneLoad?"1":"0").Append('\n');
+            sb.Append("sceneTexturePrewarmEnabled=").Append(sceneTexturePrewarmEnabled?"1":"0").Append('\n');
+            sb.Append("sceneLoadMode=").Append(sceneLoadMode).Append('\n');
             sb.Append("missingDepsDownloadRoot=").Append(missingDepsDownloadRoot).Append('\n');
+            sb.Append("vrRotationEnabled=").Append(vrRotationEnabled?"1":"0").Append('\n');
+            sb.Append("vrRotationSensitivity=").Append(vrRotationSensitivity.ToString("R")).Append('\n');
+            sb.Append("vrHeightSpeed=").Append(vrHeightSpeed.ToString("R")).Append('\n');
+            sb.Append("vrRotationDeadzone=").Append(vrRotationDeadzone.ToString("R")).Append('\n');
+            sb.Append("vrRotationInvert=").Append(vrRotationInvert?"1":"0").Append('\n');
+            sb.Append("vrHeightInvert=").Append(vrHeightInvert?"1":"0").Append('\n');
+            sb.Append("vrRotationSnapAngle=").Append(vrRotationSnapAngle.ToString("R")).Append('\n');
+            sb.Append("vrRotationSmoothing=").Append(vrRotationSmoothing.ToString("R")).Append('\n');
             string tmp = configPath + ".tmp";
             File.WriteAllText(tmp, sb.ToString(), Encoding.UTF8);
             if (File.Exists(configPath)) File.Delete(configPath);
@@ -1564,6 +1826,294 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
 
     private bool CanPlaceVrCanvas() {
         return GetViewTransform() != null;
+    }
+
+    private bool IsVrSessionActive() {
+        try {
+            CVRSystem sys = OpenVR.System;
+            if (sys != null) {
+                try { if (sys.IsTrackedDeviceConnected(OpenVR.k_unTrackedDeviceIndex_Hmd)) return true; } catch {}
+                uint left = sys.GetTrackedDeviceIndexForControllerRole(ETrackedControllerRole.LeftHand);
+                uint right = sys.GetTrackedDeviceIndexForControllerRole(ETrackedControllerRole.RightHand);
+                if (left != OpenVR.k_unTrackedDeviceIndexInvalid || right != OpenVR.k_unTrackedDeviceIndexInvalid) return true;
+            }
+        } catch {}
+        try {
+            if (SteamBool(SteamVR_Actions.default_HeadsetOnHead, SteamVR_Input_Sources.Head)) return true;
+            if (SteamBool(SteamVR_Actions.default_HeadsetOnHead, SteamVR_Input_Sources.Any)) return true;
+        } catch {}
+        return false;
+    }
+
+    private void ExitVrRotationMode(string reason) {
+        if (vrRotationModeActive) DebugLog("VR rotation mode exit: " + reason);
+        vrRotationModeActive = false;
+        leftStickClickHeldLastFrame = false;
+        vrRotationFilteredX = 0f;
+        vrRotationFilteredY = 0f;
+        pendingVrYaw = 0f;
+        pendingVrHeight = 0f;
+        vrSnapArmed = true;
+    }
+
+    private Transform GetNavigationRigTransform() {
+        try {
+            if (SuperController.singleton == null) return null;
+            if (SuperController.singleton.navigationRig != null) return SuperController.singleton.navigationRig;
+            if (SuperController.singleton.navigationRigParent != null) return SuperController.singleton.navigationRigParent;
+            if (SuperController.singleton.navigationPlayer != null) return SuperController.singleton.navigationPlayer;
+        } catch {}
+        return null;
+    }
+
+    private Vector3 GetVrRotationPivot() {
+        try {
+            if (SuperController.singleton != null) {
+                if (SuperController.singleton.navigationCamera != null) return SuperController.singleton.navigationCamera.position;
+                if (SuperController.singleton.centerCameraTarget != null) return SuperController.singleton.centerCameraTarget.transform.position;
+            }
+        } catch {}
+        Transform view = GetViewTransform();
+        if (view != null) return view.position;
+        Transform rig = GetNavigationRigTransform();
+        return rig != null ? rig.position : Vector3.zero;
+    }
+
+    private bool ShouldPauseVrRotation() {
+        try {
+            if (!vrRotationEnabled) return true;
+            if (!IsVrSessionActive()) return true;
+            SuperController sc = SuperController.singleton;
+            if (sc == null) return true;
+            if (sc.isLoading) return true;
+            if (sc.navigationDisabled) return true;
+            if (sc.disableAllNavigation) return true;
+            // Grab-navigate writes the same navigationRig; pause while stick-click is held
+            // after mode already toggled so we don't fight VaM grab navigation.
+            if (!sc.disableGrabNavigation && leftStickClickHeldLastFrame) return true;
+        } catch { return true; }
+        return GetNavigationRigTransform() == null;
+    }
+
+    private bool TryReadVrRotationInput(out bool togglePressed, out float stickX, out float stickY, out string sourceName) {
+        togglePressed = false;
+        stickX = 0f;
+        stickY = 0f;
+        sourceName = "none";
+
+        bool steamOk = false, steamClick = false, steamDown = false;
+        float steamX = 0f, steamY = 0f;
+        try {
+            steamClick = SteamBool(SteamVR_Actions.default_GrabNavigate, SteamVR_Input_Sources.LeftHand);
+            steamDown = SteamBoolDown(SteamVR_Actions.default_GrabNavigate, SteamVR_Input_Sources.LeftHand);
+            Vector2 axis = Vector2.zero;
+            bool gotAxis = false;
+            try {
+                if (SuperController.singleton != null && SuperController.singleton.freeMoveAction != null) {
+                    axis = SuperController.singleton.freeMoveAction.GetAxis(SteamVR_Input_Sources.LeftHand);
+                    gotAxis = true;
+                }
+            } catch {}
+            if (!gotAxis) axis = SteamAxis(SteamVR_Actions.default_FreeMove, SteamVR_Input_Sources.LeftHand);
+            steamX = axis.x;
+            steamY = axis.y;
+            steamOk = true;
+        } catch {}
+
+        bool openOk = false, openClick = false;
+        float openX = 0f, openY = 0f;
+        try {
+            CVRSystem sys = OpenVR.System;
+            if (sys != null) {
+                uint left = sys.GetTrackedDeviceIndexForControllerRole(ETrackedControllerRole.LeftHand);
+                if (left != OpenVR.k_unTrackedDeviceIndexInvalid) {
+                    VRControllerState_t ls = new VRControllerState_t();
+                    if (sys.GetControllerState(left, ref ls, (uint)Marshal.SizeOf(typeof(VRControllerState_t)))) {
+                        openClick = RawButton(ls.ulButtonPressed, EVRButtonId.k_EButton_Axis0);
+                        openX = ls.rAxis0.x;
+                        openY = ls.rAxis0.y;
+                        // Some devices expose stick on Axis2; take the stronger pair.
+                        float a0 = openX * openX + openY * openY;
+                        float a2 = ls.rAxis2.x * ls.rAxis2.x + ls.rAxis2.y * ls.rAxis2.y;
+                        if (a2 > a0) { openX = ls.rAxis2.x; openY = ls.rAxis2.y; }
+                        openOk = true;
+                    }
+                }
+            }
+        } catch {}
+
+        if (!steamOk && !openOk) return false;
+
+        // Click: prefer Steam GrabNavigate (VaM stick-click binding), fall back to OpenVR Axis0 pressed.
+        bool click = (steamOk && steamClick) || (openOk && openClick);
+        bool edge = (steamOk && steamDown) || (click && !leftStickClickHeldLastFrame);
+        togglePressed = edge;
+        leftStickClickHeldLastFrame = click;
+
+        // Axis: prefer the source with larger stick magnitude.
+        if (steamOk && openOk) {
+            float sm = steamX * steamX + steamY * steamY;
+            float om = openX * openX + openY * openY;
+            if (sm >= om) { stickX = steamX; stickY = steamY; sourceName = "SteamVR"; }
+            else { stickX = openX; stickY = openY; sourceName = "OpenVR"; }
+            if (steamDown || steamClick) sourceName = "SteamVR";
+            else if (openClick) sourceName = "OpenVR";
+        } else if (steamOk) {
+            stickX = steamX; stickY = steamY; sourceName = "SteamVR";
+        } else {
+            stickX = openX; stickY = openY; sourceName = "OpenVR";
+        }
+        return true;
+    }
+
+    private float NormalizeStickAxis(float v) {
+        float dz = Mathf.Clamp(vrRotationDeadzone, 0.05f, 0.50f);
+        float abs = Mathf.Abs(v);
+        if (abs <= dz) return 0f;
+        float n = Mathf.Clamp01((abs - dz) / (1f - dz));
+        return Mathf.Sign(v) * n;
+    }
+
+    private float SmoothStickAxis(float current, float target, float dt) {
+        float smooth = Mathf.Clamp(vrRotationSmoothing, 0f, 0.40f);
+        if (smooth <= 0.0001f) return target;
+        float k = 1f - Mathf.Exp(-dt / smooth);
+        return Mathf.Lerp(current, target, k);
+    }
+
+    private void UpdateVrRotationInput() {
+        pendingVrYaw = 0f;
+        pendingVrHeight = 0f;
+        if (!vrRotationEnabled) {
+            if (vrRotationModeActive) ExitVrRotationMode("disabled");
+            return;
+        }
+        if (!IsVrSessionActive()) {
+            if (vrRotationModeActive) ExitVrRotationMode("no-vr");
+            return;
+        }
+
+        bool togglePressed;
+        float stickX, stickY;
+        string sourceName;
+        if (!TryReadVrRotationInput(out togglePressed, out stickX, out stickY, out sourceName)) {
+            if (vrRotationModeActive) {
+                // Keep mode but stop motion if input briefly unavailable.
+                vrRotationFilteredX = 0f;
+                vrRotationFilteredY = 0f;
+            }
+            return;
+        }
+
+        if (togglePressed) {
+            vrRotationModeActive = !vrRotationModeActive;
+            vrRotationFilteredX = 0f;
+            vrRotationFilteredY = 0f;
+            vrSnapArmed = true;
+            pendingVrYaw = 0f;
+            pendingVrHeight = 0f;
+            DebugLog("VR look mode " + (vrRotationModeActive ? "ON" : "OFF") + " via " + sourceName + " LeftStickClick");
+            SetStatus("镜头模式：" + (vrRotationModeActive ? "开（左右转向 / 前后升降，再按摇杆退出）" : "关"), true);
+        }
+
+        if (!vrRotationModeActive) {
+            vrRotationFilteredX = 0f;
+            vrRotationFilteredY = 0f;
+            return;
+        }
+        if (ShouldPauseVrRotation()) {
+            vrRotationFilteredX = 0f;
+            vrRotationFilteredY = 0f;
+            return;
+        }
+
+        float targetX = NormalizeStickAxis(stickX);
+        float targetY = NormalizeStickAxis(stickY);
+        if (vrRotationInvert) targetX = -targetX;
+        if (vrHeightInvert) targetY = -targetY;
+        float dt = Mathf.Min(Time.unscaledDeltaTime, 0.05f);
+        vrRotationFilteredX = SmoothStickAxis(vrRotationFilteredX, targetX, dt);
+        vrRotationFilteredY = SmoothStickAxis(vrRotationFilteredY, targetY, dt);
+
+        // Stick X -> horizontal yaw
+        if (Mathf.Abs(vrRotationFilteredX) < 0.001f) {
+            vrSnapArmed = true;
+        } else {
+            float snap = vrRotationSnapAngle;
+            if (snap > 0.5f) {
+                if (vrSnapArmed) {
+                    pendingVrYaw = Mathf.Sign(vrRotationFilteredX) * snap;
+                    vrSnapArmed = false;
+                }
+            } else {
+                float sens = Mathf.Clamp(vrRotationSensitivity, 10f, 180f);
+                pendingVrYaw = vrRotationFilteredX * sens * dt;
+            }
+        }
+
+        // Stick Y -> vertical height (raise / lower view)
+        if (Mathf.Abs(vrRotationFilteredY) >= 0.001f) {
+            float hSpeed = Mathf.Clamp(vrHeightSpeed, 0.10f, 3.00f);
+            pendingVrHeight = vrRotationFilteredY * hSpeed * dt;
+        }
+
+        string diag = "mode=1 src=" + sourceName
+            + " x=" + stickX.ToString("0.00") + " y=" + stickY.ToString("0.00")
+            + " yaw=" + pendingVrYaw.ToString("0.00")
+            + " h=" + pendingVrHeight.ToString("0.000");
+        if (diag != lastVrRotationDiag && Time.realtimeSinceStartup >= nextVrRotationQuietDiagAt) {
+            lastVrRotationDiag = diag;
+            nextVrRotationQuietDiagAt = Time.realtimeSinceStartup + 2f;
+            DebugLog("VR look: " + diag);
+        }
+    }
+
+    private void ApplyPendingVrYaw() {
+        if (!vrRotationModeActive) return;
+        if (ShouldPauseVrRotation()) { pendingVrYaw = 0f; pendingVrHeight = 0f; return; }
+
+        if (Mathf.Abs(pendingVrYaw) >= 0.0001f) {
+            Transform rig = GetNavigationRigTransform();
+            if (rig != null) {
+                float yaw = pendingVrYaw;
+                pendingVrYaw = 0f;
+                ApplyVrYawAroundHeadset(rig, yaw);
+            } else pendingVrYaw = 0f;
+        }
+
+        if (Mathf.Abs(pendingVrHeight) >= 0.00001f) {
+            float dh = pendingVrHeight;
+            pendingVrHeight = 0f;
+            ApplyVrHeightDelta(dh);
+        }
+    }
+
+    private void ApplyVrYawAroundHeadset(Transform rig, float deltaYaw) {
+        if (rig == null || Mathf.Abs(deltaYaw) < 0.0001f) return;
+        Vector3 pivot = GetVrRotationPivot();
+        Quaternion q = Quaternion.AngleAxis(deltaYaw, Vector3.up);
+        Vector3 offset = rig.position - pivot;
+        rig.position = pivot + q * offset;
+        rig.rotation = q * rig.rotation;
+    }
+
+    private void ApplyVrHeightDelta(float deltaMeters) {
+        if (Mathf.Abs(deltaMeters) < 0.00001f) return;
+        try {
+            SuperController sc = SuperController.singleton;
+            if (sc != null) {
+                // VaM-native player height offset (same as in-game height slider).
+                sc.playerHeightAdjustAdjust(deltaMeters);
+                return;
+            }
+        } catch (Exception e) {
+            DebugLog("playerHeightAdjustAdjust failed: " + e.Message);
+        }
+        // Fallback: translate navigation rig in world up.
+        try {
+            Transform rig = GetNavigationRigTransform();
+            if (rig != null) rig.position += Vector3.up * deltaMeters;
+        } catch {}
     }
 
     private void ScheduleVrOpenRetry(string reason) {
@@ -1907,6 +2457,382 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
     private byte[] ReadEntryBytes(ZipFile z, ZipEntry e, long max) { if(e.Size>max) return null; using(Stream s=z.GetInputStream(e)) { MemoryStream ms=new MemoryStream(); byte[] b=new byte[8192]; int r; long total=0; while((r=s.Read(b,0,b.Length))>0) { total+=r; if(total>max) return null; ms.Write(b,0,r); } return ms.ToArray(); } }
     private byte[] ReadBytes(PackageLite p, string name, long max) { ZipFile z=null; try { z=new ZipFile(p.fullPath); ZipEntry e=FindEntry(z,name); if(e==null) return null; return ReadEntryBytes(z,e,max); } finally { if(z!=null) z.Close(); } }
 
+    private string GetTimelineCachePath(PackageLite p, string scene) {
+        if (p == null || string.IsNullOrEmpty(p.fullPath) || string.IsNullOrEmpty(dataRoot)) return "";
+        FileInfo fi = new FileInfo(p.fullPath);
+        string key = Path.GetFullPath(p.fullPath) + "|" + fi.Length.ToString(CultureInfo.InvariantCulture) + "|"
+            + fi.LastWriteTimeUtc.Ticks.ToString(CultureInfo.InvariantCulture) + "|" + Norm(scene) + "|" + TimelineConverterVersion;
+        return Path.Combine(Path.Combine(dataRoot, "timeline-cache"), Sha1Hex(key) + ".json");
+    }
+
+    private bool TryReadTimelineCache(PackageLite p, string scene, out string json, out string cachePath) {
+        json = "";
+        cachePath = GetTimelineCachePath(p, scene);
+        try {
+            if (string.IsNullOrEmpty(cachePath) || !File.Exists(cachePath)) return false;
+            FileInfo fi = new FileInfo(cachePath);
+            if (fi.Length <= 0 || fi.Length > MaxLargeSceneTextBytes) return false;
+            json = File.ReadAllText(cachePath, Encoding.UTF8);
+            return !string.IsNullOrEmpty(json);
+        } catch(Exception e) {
+            DebugLog("Timeline cache read failed: " + cachePath + " | " + e.Message);
+            json = "";
+            return false;
+        }
+    }
+
+    private string ReadSceneText(PackageLite p, string scene, long maxBytes, out long entryBytes) {
+        entryBytes = 0;
+        if (p == null || string.IsNullOrEmpty(p.fullPath)) return "";
+        ZipFile zip = null;
+        try {
+            zip = new ZipFile(p.fullPath);
+            ZipEntry entry = FindEntry(zip, scene);
+            if (entry == null) return "";
+            entryBytes = entry.Size;
+            if (entry.Size < 0 || entry.Size > maxBytes) throw new IOException("场景 JSON 超过读取上限：" + entry.Size + " > " + maxBytes);
+            using(Stream input = zip.GetInputStream(entry))
+            using(StreamReader reader = new StreamReader(input, Encoding.UTF8, true, 1024 * 1024)) return reader.ReadToEnd();
+        } finally {
+            if (zip != null) zip.Close();
+        }
+    }
+
+    private string ReadSceneJsonWithTimelineOptimization(PackageLite p, string scene, out TimelineOptimizationInfo info) {
+        info = new TimelineOptimizationInfo();
+        info.cachePath = GetTimelineCachePath(p, scene);
+        string cached;
+        string cachePath;
+        Stopwatch sw = Stopwatch.StartNew();
+        if (TryReadTimelineCache(p, scene, out cached, out cachePath)) {
+            sw.Stop();
+            info.cacheHit = true;
+            info.optimized = true;
+            info.cacheReadMs = sw.Elapsed.TotalMilliseconds;
+            info.outputBytes = new FileInfo(cachePath).Length;
+            DebugLog("Timeline optimization cache HIT: uid=" + p.uid + ", scene=" + scene + ", bytes=" + info.outputBytes + ", readMs=" + info.cacheReadMs.ToString("0") + ", cache=" + cachePath);
+            return cached;
+        }
+
+        sw.Reset(); sw.Start();
+        long entryBytes;
+        string source = ReadSceneText(p, scene, MaxLargeSceneTextBytes, out entryBytes);
+        sw.Stop();
+        info.readMs = sw.Elapsed.TotalMilliseconds;
+        info.sourceBytes = entryBytes;
+        if (string.IsNullOrEmpty(source)) return "";
+
+        string error;
+        sw.Reset(); sw.Start();
+        bool optimized = TryOptimizeLegacyTimelineSceneToCache(source, info.cachePath, info, out error);
+        sw.Stop();
+        info.optimizeMs = sw.Elapsed.TotalMilliseconds;
+        if (!optimized) {
+            info.error = error;
+            DebugLog("Timeline optimization skipped: uid=" + p.uid + ", scene=" + scene + ", sourceBytes=" + info.sourceBytes + ", readMs=" + info.readMs.ToString("0") + ", optimizeMs=" + info.optimizeMs.ToString("0") + ", reason=" + error);
+            return source;
+        }
+
+        info.optimized = true;
+        bool releaseLargeSource = source.Length > 128 * 1024 * 1024;
+        source = null;
+        if (releaseLargeSource) GC.Collect();
+        sw.Reset(); sw.Start();
+        string result = File.ReadAllText(info.cachePath, Encoding.UTF8);
+        sw.Stop();
+        info.cacheReadMs = sw.Elapsed.TotalMilliseconds;
+        DebugLog("Timeline optimization cache MISS converted: uid=" + p.uid + ", scene=" + scene + ", sourceBytes=" + info.sourceBytes + ", outputBytes=" + info.outputBytes + ", animations=" + info.animations + ", curves=" + info.curves + ", keys=" + info.keyframes + ", readMs=" + info.readMs.ToString("0") + ", optimizeMs=" + info.optimizeMs.ToString("0") + ", cacheReadMs=" + info.cacheReadMs.ToString("0") + ", cache=" + info.cachePath);
+        return result;
+    }
+
+    private static bool TryOptimizeLegacyTimelineSceneToCache(string source, string cachePath, TimelineOptimizationInfo info, out string error) {
+        error = "";
+        string tempPath = "";
+        try {
+            if (string.IsNullOrEmpty(source)) { error = "scene JSON is empty"; return false; }
+            if (string.IsNullOrEmpty(cachePath)) { error = "cache path is empty"; return false; }
+            SceneJsonAnalysis analysis = new SceneJsonAnalysis();
+            string analysisError;
+            if (!TryAnalyzeSceneAtoms(source, analysis, out analysisError)) { error = analysisError; return false; }
+
+            List<TimelineRewriteSpan> rewrites = new List<TimelineRewriteSpan>();
+            for (int atomIndex = 0; atomIndex < analysis.atoms.Count; atomIndex++) {
+                SceneAtomSpan atom = analysis.atoms[atomIndex];
+                TimelinePropertySpan storables = FindTimelineDirectProperty(source, atom.start, atom.start + atom.length, "storables");
+                if (storables == null || storables.kind != '[') continue;
+                List<TimelineObjectSpan> storablesList = ReadTimelineObjectArray(source, storables.start, storables.start + storables.length);
+                for (int storableIndex = 0; storableIndex < storablesList.Count; storableIndex++) {
+                    TimelineObjectSpan storable = storablesList[storableIndex];
+                    string id;
+                    if (!TryFindDirectStringProperty(source, storable.start, storable.start + storable.length, "id", out id)
+                        || id.IndexOf("VamTimeline", StringComparison.OrdinalIgnoreCase) < 0) continue;
+                    TimelinePropertySpan animation = FindTimelineDirectProperty(source, storable.start, storable.start + storable.length, "Animation");
+                    if (animation == null || animation.kind != '{') continue;
+                    List<TimelinePropertySpan> animationProperties = ReadTimelineDirectProperties(source, animation.start, animation.start + animation.length);
+                    if (FindTimelineProperty(animationProperties, "SerializeVersion") != null || FindTimelineProperty(animationProperties, "SerializeMode") != null) continue;
+                    TimelinePropertySpan clips = FindTimelineProperty(animationProperties, "Clips");
+                    if (clips == null || clips.kind != '[') continue;
+
+                    List<TimelineRewriteSpan> animationCurves = new List<TimelineRewriteSpan>();
+                    List<TimelineObjectSpan> clipObjects = ReadTimelineObjectArray(source, clips.start, clips.start + clips.length);
+                    for (int clipIndex = 0; clipIndex < clipObjects.Count; clipIndex++) {
+                        TimelineObjectSpan clip = clipObjects[clipIndex];
+                        List<TimelinePropertySpan> clipProperties = ReadTimelineDirectProperties(source, clip.start, clip.start + clip.length);
+                        CollectTimelineCurves(source, FindTimelineProperty(clipProperties, "Controllers"), true, animationCurves);
+                        CollectTimelineCurves(source, FindTimelineProperty(clipProperties, "FloatParams"), false, animationCurves);
+                    }
+                    if (animationCurves.Count == 0) continue;
+                    for (int c = 0; c < animationCurves.Count; c++) rewrites.Add(animationCurves[c]);
+                    TimelineRewriteSpan header = new TimelineRewriteSpan();
+                    header.start = animation.start + 1;
+                    header.animationHeader = true;
+                    rewrites.Add(header);
+                    info.animations++;
+                    info.curves += animationCurves.Count;
+                }
+            }
+            if (info.animations == 0 || info.curves == 0) { error = "legacy Timeline animation was not found"; return false; }
+
+            rewrites.Sort(delegate(TimelineRewriteSpan a, TimelineRewriteSpan b) {
+                int compare = a.start.CompareTo(b.start);
+                if (compare != 0) return compare;
+                return a.animationHeader == b.animationHeader ? 0 : (a.animationHeader ? -1 : 1);
+            });
+            string cacheDir = Path.GetDirectoryName(cachePath);
+            Directory.CreateDirectory(cacheDir);
+            tempPath = cachePath + ".tmp_" + Process.GetCurrentProcess().Id.ToString(CultureInfo.InvariantCulture) + "_" + DateTime.UtcNow.Ticks.ToString(CultureInfo.InvariantCulture);
+            using(StreamWriter writer = new StreamWriter(tempPath, false, new UTF8Encoding(false), 1024 * 1024)) {
+                int cursor = 0;
+                for (int i = 0; i < rewrites.Count; i++) {
+                    TimelineRewriteSpan rewrite = rewrites[i];
+                    if (rewrite.start < cursor) throw new InvalidDataException("overlapping Timeline rewrite at " + rewrite.start);
+                    WriteTimelineSlice(writer, source, cursor, rewrite.start - cursor);
+                    if (rewrite.animationHeader) {
+                        writer.Write("\"SerializeVersion\":\"283\",\"SerializeMode\":\"2\",");
+                    } else {
+                        info.keyframes += WriteTimelineOptimizedCurve(writer, source, rewrite.start, rewrite.start + rewrite.length);
+                        cursor = rewrite.start + rewrite.length;
+                    }
+                    if (rewrite.animationHeader) cursor = rewrite.start;
+                }
+                WriteTimelineSlice(writer, source, cursor, source.Length - cursor);
+            }
+            info.outputBytes = new FileInfo(tempPath).Length;
+            if (info.outputBytes <= 0) throw new InvalidDataException("optimized Timeline cache is empty");
+            if (File.Exists(cachePath)) File.Delete(cachePath);
+            File.Move(tempPath, cachePath);
+            tempPath = "";
+            return true;
+        } catch(Exception e) {
+            error = e.GetType().Name + ": " + e.Message;
+            return false;
+        } finally {
+            if (!string.IsNullOrEmpty(tempPath)) { try { if (File.Exists(tempPath)) File.Delete(tempPath); } catch {} }
+        }
+    }
+
+    private static void CollectTimelineCurves(string source, TimelinePropertySpan targets, bool controllers, List<TimelineRewriteSpan> result) {
+        if (targets == null || targets.kind != '[') return;
+        List<TimelineObjectSpan> targetObjects = ReadTimelineObjectArray(source, targets.start, targets.start + targets.length);
+        for (int targetIndex = 0; targetIndex < targetObjects.Count; targetIndex++) {
+            TimelineObjectSpan target = targetObjects[targetIndex];
+            List<TimelinePropertySpan> properties = ReadTimelineDirectProperties(source, target.start, target.start + target.length);
+            for (int propertyIndex = 0; propertyIndex < properties.Count; propertyIndex++) {
+                TimelinePropertySpan property = properties[propertyIndex];
+                bool isCurve = controllers
+                    ? property.key == "X" || property.key == "Y" || property.key == "Z" || property.key == "RotX" || property.key == "RotY" || property.key == "RotZ" || property.key == "RotW"
+                    : property.key == "Value";
+                if (!isCurve || property.kind != '[') continue;
+                char first = FirstTimelineArrayValueKind(source, property.start, property.start + property.length);
+                if (first == '\0') continue;
+                if (first != '{') throw new InvalidDataException("Timeline curve is not in legacy object format at " + property.start);
+                TimelineRewriteSpan rewrite = new TimelineRewriteSpan();
+                rewrite.start = property.start;
+                rewrite.length = property.length;
+                result.Add(rewrite);
+            }
+        }
+    }
+
+    private static char FirstTimelineArrayValueKind(string source, int start, int end) {
+        int cursor = start + 1;
+        while (cursor < end && (char.IsWhiteSpace(source[cursor]) || source[cursor] == ',')) cursor++;
+        if (cursor >= end || source[cursor] == ']') return '\0';
+        return source[cursor];
+    }
+
+    private static TimelinePropertySpan FindTimelineDirectProperty(string source, int start, int end, string key) {
+        return FindTimelineProperty(ReadTimelineDirectProperties(source, start, end), key);
+    }
+
+    private static TimelinePropertySpan FindTimelineProperty(List<TimelinePropertySpan> properties, string key) {
+        for (int i = 0; i < properties.Count; i++) if (string.Equals(properties[i].key, key, StringComparison.Ordinal)) return properties[i];
+        return null;
+    }
+
+    private static List<TimelinePropertySpan> ReadTimelineDirectProperties(string source, int start, int end) {
+        List<TimelinePropertySpan> result = new List<TimelinePropertySpan>();
+        if (string.IsNullOrEmpty(source) || start < 0 || start >= end || source[start] != '{') return result;
+        int cursor = start + 1;
+        while (cursor < end - 1) {
+            while (cursor < end && (char.IsWhiteSpace(source[cursor]) || source[cursor] == ',')) cursor++;
+            if (cursor >= end - 1 || source[cursor] != '"') break;
+            string key;
+            int afterKey;
+            if (!TryReadJsonString(source, cursor, end, out key, out afterKey)) break;
+            cursor = afterKey;
+            while (cursor < end && char.IsWhiteSpace(source[cursor])) cursor++;
+            if (cursor >= end || source[cursor++] != ':') break;
+            while (cursor < end && char.IsWhiteSpace(source[cursor])) cursor++;
+            int valueStart = cursor;
+            if (cursor >= end) break;
+            char kind = source[cursor];
+            if (kind == '{' || kind == '[') {
+                int close = FindMatchingJsonContainer(source, cursor, kind, kind == '{' ? '}' : ']');
+                if (close < 0 || close >= end) break;
+                cursor = close + 1;
+            } else if (kind == '"') {
+                string ignored;
+                int next;
+                if (!TryReadJsonString(source, cursor, end, out ignored, out next)) break;
+                cursor = next;
+            } else {
+                while (cursor < end && source[cursor] != ',' && source[cursor] != '}') cursor++;
+            }
+            TimelinePropertySpan property = new TimelinePropertySpan();
+            property.key = key;
+            property.start = valueStart;
+            property.length = cursor - valueStart;
+            property.kind = kind;
+            result.Add(property);
+        }
+        return result;
+    }
+
+    private static List<TimelineObjectSpan> ReadTimelineObjectArray(string source, int start, int end) {
+        List<TimelineObjectSpan> result = new List<TimelineObjectSpan>();
+        if (string.IsNullOrEmpty(source) || start < 0 || start >= end || source[start] != '[') return result;
+        int cursor = start + 1;
+        while (cursor < end - 1) {
+            while (cursor < end && (char.IsWhiteSpace(source[cursor]) || source[cursor] == ',')) cursor++;
+            if (cursor >= end - 1 || source[cursor] == ']') break;
+            if (source[cursor] != '{') throw new InvalidDataException("expected JSON object at " + cursor);
+            int close = FindMatchingJsonContainer(source, cursor, '{', '}');
+            if (close < 0 || close >= end) throw new InvalidDataException("unclosed JSON object at " + cursor);
+            TimelineObjectSpan item = new TimelineObjectSpan();
+            item.start = cursor;
+            item.length = close - cursor + 1;
+            result.Add(item);
+            cursor = close + 1;
+        }
+        return result;
+    }
+
+    private static long WriteTimelineOptimizedCurve(TextWriter writer, string source, int start, int end) {
+        writer.Write('[');
+        long written = 0;
+        float lastTime = -1f;
+        float lastValue = 0f;
+        int lastCurveType = 3;
+        bool first = true;
+        int cursor = start + 1;
+        while (cursor < end - 1) {
+            while (cursor < end && (char.IsWhiteSpace(source[cursor]) || source[cursor] == ',')) cursor++;
+            if (cursor >= end - 1 || source[cursor] == ']') break;
+            if (source[cursor] != '{') throw new InvalidDataException("expected legacy Timeline keyframe at " + cursor);
+            int close = FindMatchingJsonContainer(source, cursor, '{', '}');
+            if (close < 0 || close >= end) throw new InvalidDataException("unclosed Timeline keyframe at " + cursor);
+            List<TimelinePropertySpan> fields = ReadTimelineDirectProperties(source, cursor, close + 1);
+            string text;
+            if (!TryReadTimelineScalar(source, fields, "t", out text)) throw new InvalidDataException("Timeline keyframe has no time at " + cursor);
+            float time = SnapTimelineFloat(float.Parse(text, CultureInfo.InvariantCulture));
+            float value = TryReadTimelineScalar(source, fields, "v", out text) ? float.Parse(text, CultureInfo.InvariantCulture) : lastValue;
+            int curveType = TryReadTimelineScalar(source, fields, "c", out text) ? int.Parse(text, CultureInfo.InvariantCulture) : lastCurveType;
+            if (Math.Abs(time - lastTime) > float.Epsilon) {
+                if (!first) writer.Write(',');
+                if (curveType == 0) WriteTimelineLeaveAsIsKeyframe(writer, source, fields, time, value, curveType);
+                else writer.Write('"' + EncodeTimelineKeyframe(time, value, curveType, lastValue, lastCurveType) + '"');
+                first = false;
+                written++;
+                lastTime = time;
+                lastValue = value;
+                lastCurveType = curveType;
+            }
+            cursor = close + 1;
+        }
+        writer.Write(']');
+        return written;
+    }
+
+    private static bool TryReadTimelineScalar(string source, List<TimelinePropertySpan> fields, string key, out string value) {
+        value = "";
+        TimelinePropertySpan field = FindTimelineProperty(fields, key);
+        if (field == null) return false;
+        if (field.kind == '"') {
+            int next;
+            return TryReadJsonString(source, field.start, field.start + field.length, out value, out next);
+        }
+        value = source.Substring(field.start, field.length).Trim();
+        return value.Length > 0;
+    }
+
+    private static void WriteTimelineLeaveAsIsKeyframe(TextWriter writer, string source, List<TimelinePropertySpan> fields, float time, float value, int curveType) {
+        writer.Write("{\"t\":\"");
+        writer.Write(time.ToString(CultureInfo.InvariantCulture));
+        writer.Write("\",\"v\":\"");
+        writer.Write(value.ToString(CultureInfo.InvariantCulture));
+        writer.Write("\",\"c\":\"");
+        writer.Write(curveType.ToString(CultureInfo.InvariantCulture));
+        writer.Write('"');
+        string text;
+        if (TryReadTimelineScalar(source, fields, "i", out text)) { writer.Write(",\"i\":\""); writer.Write(text); writer.Write('"'); }
+        if (TryReadTimelineScalar(source, fields, "o", out text)) { writer.Write(",\"o\":\""); writer.Write(text); writer.Write('"'); }
+        writer.Write('}');
+    }
+
+    private static float SnapTimelineFloat(float value) {
+        value = (float)(Math.Round(value * 1000f) / 1000f);
+        return value < 0f ? 0f : value;
+    }
+
+    private static string EncodeTimelineKeyframe(float time, float value, int curveType, float lastValue, int lastCurveType) {
+        bool hasValue = Math.Abs(lastValue - value) > float.Epsilon;
+        bool hasCurveType = lastCurveType != curveType;
+        StringBuilder sb = new StringBuilder(19);
+        sb.Append((char)('A' + (hasValue ? 1 : 0) + (hasCurveType ? 2 : 0)));
+        AppendTimelineFloatHex(sb, time);
+        if (hasValue) AppendTimelineFloatHex(sb, value);
+        if (hasCurveType) AppendTimelineByteHex(sb, (byte)curveType);
+        return sb.ToString();
+    }
+
+    private static readonly char[] TimelineHex = "0123456789ABCDEF".ToCharArray();
+
+    private static void AppendTimelineFloatHex(StringBuilder sb, float value) {
+        byte[] bytes = BitConverter.GetBytes(value);
+        for (int i = 0; i < bytes.Length; i++) AppendTimelineByteHex(sb, bytes[i]);
+    }
+
+    private static void AppendTimelineByteHex(StringBuilder sb, byte value) {
+        sb.Append(TimelineHex[value >> 4]);
+        sb.Append(TimelineHex[value & 15]);
+    }
+
+    private static void WriteTimelineSlice(TextWriter writer, string source, int start, int length) {
+        const int BufferSize = 1024 * 1024;
+        if (length <= 0) return;
+        char[] buffer = new char[Math.Min(BufferSize, length)];
+        int cursor = start;
+        int remaining = length;
+        while (remaining > 0) {
+            int count = Math.Min(buffer.Length, remaining);
+            source.CopyTo(cursor, buffer, 0, count);
+            writer.Write(buffer, 0, count);
+            cursor += count;
+            remaining -= count;
+        }
+    }
+
     private int LoadCacheIntoMemory() {
         int n=0;
         try {
@@ -2240,6 +3166,25 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         // 快捷模式按钮已移除：只保留“包含服装/头发”开关，界面更干净
         presetModeRoot = null;
 
+        sceneModeRoot = CreateRow(detailContent.transform, "SceneLoadModeRow", isVRMode ? 46f : 40f, 6, true);
+        sceneFullModeBtn = MakeButton(sceneModeRoot.transform, "完整", 13, colBtn);
+        SetFlexibleItem(sceneFullModeBtn.gameObject, 0f, 1f);
+        sceneFullModeBtn.onClick.AddListener(() => SetSceneLoadMode(0));
+        scenePrimaryModeBtn = MakeButton(sceneModeRoot.transform, "人物优先", 13, colBtn);
+        SetFlexibleItem(scenePrimaryModeBtn.gameObject, 0f, 1f);
+        scenePrimaryModeBtn.onClick.AddListener(() => SetSceneLoadMode(1));
+        sceneMinimalModeBtn = MakeButton(sceneModeRoot.transform, "极简人物", 13, colBtn);
+        SetFlexibleItem(sceneMinimalModeBtn.gameObject, 0f, 1f);
+        sceneMinimalModeBtn.onClick.AddListener(() => SetSceneLoadMode(2));
+
+        scenePersonRoot = CreateRow(detailContent.transform, "ScenePrimaryPersonRow", isVRMode ? 46f : 40f, 8, true);
+        Button scenePersonBtn = MakeButton(scenePersonRoot.transform, "切换主角", 13, colBtn);
+        SetFlexibleItem(scenePersonBtn.gameObject, 96f, 0f);
+        scenePersonBtn.onClick.AddListener(() => CycleScenePrimaryPerson());
+        scenePrimaryPersonLabel = MakeText(scenePersonRoot.transform, "ScenePrimaryPersonLabel", "主角：自动", 13, TextAnchor.MiddleLeft, colTextPrimary);
+        LayoutElement scenePersonLe = scenePrimaryPersonLabel.gameObject.AddComponent<LayoutElement>();
+        scenePersonLe.flexibleWidth = 1f; scenePersonLe.minHeight = isVRMode ? 46f : 40f;
+
         // Primary actions - only one relevant will show
         sceneActionRoot = CreateRow(detailContent.transform, "SceneActionRow", isVRMode ? 50f : 46f, 8, true);
         loadSceneBtn = MakeButton(sceneActionRoot.transform, "加载场景", isVRMode ? 17 : 16, colAccent);
@@ -2248,6 +3193,10 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
             if (selectedSceneItem != null) LoadPackageScene(selectedSceneItem.package, selectedSceneItem.entryPath);
             else LinkSelected(true);
         });
+        loadDeferredSceneBtn = MakeButton(sceneActionRoot.transform, "加载其余 Atom", isVRMode ? 15 : 14, colSuccess);
+        SetFlexibleItem(loadDeferredSceneBtn.gameObject, 0f, 1f);
+        loadDeferredSceneBtn.onClick.AddListener(() => LoadDeferredSceneAtoms());
+        loadDeferredSceneBtn.gameObject.SetActive(false);
 
         presetActionRoot = CreateRow(detailContent.transform, "PresetActionRow", 46f, 8, true);
         applyPresetBtn = MakeButton(presetActionRoot.transform, "应用到人物", isVRMode ? 17 : 16, colSuccess);
@@ -2300,7 +3249,7 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         downloadProgressText.raycastTarget = false;
         StretchFull(downloadProgressText.rectTransform, 8, 8, 4, 4);
 
-        Text hint = MakeText(detailContent.transform, "Hint", "F8/F7 打开 · 右上角【设置】可开关：插件加载后自动打开", 12, TextAnchor.MiddleCenter, colTextDim);
+        Text hint = MakeText(detailContent.transform, "Hint", "F8/F7 打开 · VR:左摇杆按下=镜头模式（左右转/前后升降）", 12, TextAnchor.MiddleCenter, colTextDim);
         hint.horizontalOverflow = HorizontalWrapMode.Wrap;
         hint.verticalOverflow = VerticalWrapMode.Overflow;
         SetFixedHeight(hint.gameObject, 28f);
@@ -2409,12 +3358,20 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
 
 
 
-    private List<PackageLite> Filtered(){ var l=new List<PackageLite>(); string q=searchQuery==null?"":searchQuery.Trim().ToLowerInvariant(); if(activeCat=="Favorites" && favSubCat=="Presets") return l; foreach(var p in all){ if(activeCat=="Favorites") { if(!favoriteUids.Contains(p.uid) && !(p.firstScene!="" && favoriteScenes.Contains(SceneRef(p,p.firstScene))) && !HasFavoriteSceneForPackage(p)) continue; if(favSubCat=="Scenes" && p.firstScene=="") continue; if(favSubCat=="Looks" && !p.cats.Contains("Looks")) continue; if(favSubCat=="Scripts" && !p.cats.Contains("Scripts") && !p.cats.Contains("Plugins")) continue; } else if(activeCat=="Presets") { if(!p.cats.Contains("Presets") && !p.cats.Contains("Looks")) continue; } else if(activeCat=="All") { if(allSubFilter=="Other" && !(p.cats.Count==0 || p.cats.Contains("Other"))) continue; } else if(activeCat!="All" && !p.cats.Contains(activeCat)) continue; if(q!="" && p.uid.ToLowerInvariant().IndexOf(q)<0 && (p.description==null || p.description.ToLowerInvariant().IndexOf(q)<0)) continue; l.Add(p); } return l; }
-    private List<PresetLite> FilteredPresets(){ var l=new List<PresetLite>(); string q=searchQuery==null?"":searchQuery.Trim().ToLowerInvariant(); for(int i=0;i<localPresets.Count;i++){ PresetLite pr=localPresets[i]; if(activeCat=="Favorites" && !favoritePresets.Contains(pr.fullPath)) continue; else if(activeCat!="Favorites" && !PresetTypeMatchesActiveCat(pr.presetType)) continue; if(q!="" && pr.name.ToLowerInvariant().IndexOf(q)<0 && pr.relPath.ToLowerInvariant().IndexOf(q)<0) continue; l.Add(pr); } return l; }
+    private string PackageAuthor(PackageLite p) {
+        string uid = p == null ? "" : (p.uid ?? "").Trim();
+        int dot = uid.IndexOf('.');
+        return dot > 0 ? uid.Substring(0, dot) : "(未知作者)";
+    }
+    private bool HasAuthorFilter() { return !string.IsNullOrEmpty(authorFilter) && !string.Equals(authorFilter, "All", StringComparison.OrdinalIgnoreCase); }
+    private bool MatchesAuthor(PackageLite p) { return !HasAuthorFilter() || string.Equals(PackageAuthor(p), authorFilter, StringComparison.OrdinalIgnoreCase); }
+
+    private List<PackageLite> Filtered(){ var l=new List<PackageLite>(); string q=searchQuery==null?"":searchQuery.Trim().ToLowerInvariant(); if(activeCat=="Favorites" && favSubCat=="Presets") return l; foreach(var p in all){ if(activeCat=="Favorites") { if(!favoriteUids.Contains(p.uid) && !(p.firstScene!="" && favoriteScenes.Contains(SceneRef(p,p.firstScene))) && !HasFavoriteSceneForPackage(p)) continue; if(favSubCat=="Scenes" && p.firstScene=="") continue; if(favSubCat=="Looks" && !p.cats.Contains("Looks")) continue; if(favSubCat=="Scripts" && !p.cats.Contains("Scripts") && !p.cats.Contains("Plugins")) continue; } else if(activeCat=="Presets") { if(!p.cats.Contains("Presets") && !p.cats.Contains("Looks")) continue; } else if(activeCat=="All") { if(allSubFilter=="Other" && !(p.cats.Count==0 || p.cats.Contains("Other"))) continue; } else if(activeCat!="All" && !p.cats.Contains(activeCat)) continue; if(!MatchesAuthor(p)) continue; if(q!="" && p.uid.ToLowerInvariant().IndexOf(q)<0 && (p.description==null || p.description.ToLowerInvariant().IndexOf(q)<0)) continue; l.Add(p); } return l; }
+    private List<PresetLite> FilteredPresets(){ var l=new List<PresetLite>(); if(HasAuthorFilter()) return l; string q=searchQuery==null?"":searchQuery.Trim().ToLowerInvariant(); for(int i=0;i<localPresets.Count;i++){ PresetLite pr=localPresets[i]; if(activeCat=="Favorites" && !favoritePresets.Contains(pr.fullPath)) continue; else if(activeCat!="Favorites" && !PresetTypeMatchesActiveCat(pr.presetType)) continue; if(q!="" && pr.name.ToLowerInvariant().IndexOf(q)<0 && pr.relPath.ToLowerInvariant().IndexOf(q)<0) continue; l.Add(pr); } return l; }
     private void EnsureWearableIndex(){ if(wearableIndexBuilt)return; wearableIndexBuilt=true; wearableItems.Clear(); int errors=0; for(int i=0;i<all.Count;i++){ PackageLite p=all[i]; if(p==null || (!p.cats.Contains("Clothing") && !p.cats.Contains("Hair")))continue; ZipFile z=null; try{ z=new ZipFile(p.fullPath); Dictionary<string,string> previews=new Dictionary<string,string>(StringComparer.OrdinalIgnoreCase); List<string> defs=new List<string>(); IEnumerator en=z.GetEnumerator(); while(en.MoveNext()){ ZipEntry e=en.Current as ZipEntry; if(e==null||!e.IsFile)continue; string n=Norm(e.Name); string low=n.ToLowerInvariant(); bool cloth=low.StartsWith("custom/clothing/"); bool hair=low.StartsWith("custom/hair/"); if(!cloth&&!hair)continue; if(low.EndsWith(".vam"))defs.Add(n); else if(low.EndsWith(".jpg")||low.EndsWith(".jpeg")||low.EndsWith(".png")){ string key=Norm(Path.ChangeExtension(n,null)); if(!previews.ContainsKey(key))previews[key]=n; } } for(int j=0;j<defs.Count;j++){ string def=defs[j]; WearableLite w=new WearableLite(); w.package=p; w.entryPath=def; w.name=Path.GetFileNameWithoutExtension(def); w.wearableType=Norm(def).StartsWith("Custom/Hair/",StringComparison.OrdinalIgnoreCase)?"Hair":"Clothing"; string key=Norm(Path.ChangeExtension(def,null)); string pv; if(previews.TryGetValue(key,out pv))w.previewEntry=pv; wearableItems.Add(w); } }catch{errors++;}finally{if(z!=null)z.Close();} } wearableItems.Sort((a,b)=>{int c=string.Compare(a.name,b.name,StringComparison.OrdinalIgnoreCase);return c!=0?c:string.Compare(a.package.uid,b.package.uid,StringComparison.OrdinalIgnoreCase);}); DebugLog("Wearable index built. items="+wearableItems.Count+", errors="+errors); }
-    private List<WearableLite> FilteredWearables(){ EnsureWearableIndex(); List<WearableLite> l=new List<WearableLite>(); string q=searchQuery==null?"":searchQuery.Trim().ToLowerInvariant(); for(int i=0;i<wearableItems.Count;i++){WearableLite w=wearableItems[i];if(w.wearableType!=activeCat)continue;if(q!=""&&w.name.ToLowerInvariant().IndexOf(q)<0&&w.package.uid.ToLowerInvariant().IndexOf(q)<0)continue;l.Add(w);}return l;}
-    private List<VarPresetLite> FilteredVarPresets(){ var l=new List<VarPresetLite>(); string q=searchQuery==null?"":searchQuery.Trim().ToLowerInvariant(); var seen=new HashSet<string>(StringComparer.OrdinalIgnoreCase); for(int i=0;i<varPresets.Count;i++){ VarPresetLite vp=varPresets[i]; if(vp==null || vp.package==null) continue; if(activeCat=="Favorites" && !favoriteUids.Contains(vp.package.uid)) continue; else if(activeCat!="Favorites" && !PresetTypeMatchesActiveCat(vp.presetType)) continue; if(q!="" && vp.name.ToLowerInvariant().IndexOf(q)<0 && vp.entryPath.ToLowerInvariant().IndexOf(q)<0 && vp.package.uid.ToLowerInvariant().IndexOf(q)<0) continue; string key=Group(vp.package.uid)+"|"+vp.entryPath; if(!seen.Add(key)) continue; l.Add(vp); } return l; }
-    private List<SceneLite> FilteredScenes(){ var l=new List<SceneLite>(); string q=searchQuery==null?"":searchQuery.Trim().ToLowerInvariant(); var seen=new HashSet<string>(StringComparer.OrdinalIgnoreCase); for(int i=0;i<sceneItems.Count;i++){ SceneLite si=sceneItems[i]; if(si==null || si.package==null) continue; if(activeCat=="Favorites"){ if(!favoriteUids.Contains(si.package.uid) && !favoriteScenes.Contains(SceneRef(si.package, si.entryPath))) continue; } else if(activeCat!="Scenes" && activeCat!="Favorites") continue; if(q!="" && si.name.ToLowerInvariant().IndexOf(q)<0 && si.entryPath.ToLowerInvariant().IndexOf(q)<0 && si.package.uid.ToLowerInvariant().IndexOf(q)<0) continue; string key=Group(si.package.uid)+"|"+si.entryPath; if(!seen.Add(key)) continue; l.Add(si); } return l; }
+    private List<WearableLite> FilteredWearables(){ EnsureWearableIndex(); List<WearableLite> l=new List<WearableLite>(); string q=searchQuery==null?"":searchQuery.Trim().ToLowerInvariant(); for(int i=0;i<wearableItems.Count;i++){WearableLite w=wearableItems[i];if(w.wearableType!=activeCat)continue;if(!MatchesAuthor(w.package))continue;if(q!=""&&w.name.ToLowerInvariant().IndexOf(q)<0&&w.package.uid.ToLowerInvariant().IndexOf(q)<0)continue;l.Add(w);}return l;}
+    private List<VarPresetLite> FilteredVarPresets(){ var l=new List<VarPresetLite>(); string q=searchQuery==null?"":searchQuery.Trim().ToLowerInvariant(); var seen=new HashSet<string>(StringComparer.OrdinalIgnoreCase); for(int i=0;i<varPresets.Count;i++){ VarPresetLite vp=varPresets[i]; if(vp==null || vp.package==null) continue; if(activeCat=="Favorites" && !favoriteUids.Contains(vp.package.uid)) continue; else if(activeCat!="Favorites" && !PresetTypeMatchesActiveCat(vp.presetType)) continue; if(!MatchesAuthor(vp.package)) continue; if(q!="" && vp.name.ToLowerInvariant().IndexOf(q)<0 && vp.entryPath.ToLowerInvariant().IndexOf(q)<0 && vp.package.uid.ToLowerInvariant().IndexOf(q)<0) continue; string key=Group(vp.package.uid)+"|"+vp.entryPath; if(!seen.Add(key)) continue; l.Add(vp); } return l; }
+    private List<SceneLite> FilteredScenes(){ var l=new List<SceneLite>(); string q=searchQuery==null?"":searchQuery.Trim().ToLowerInvariant(); var seen=new HashSet<string>(StringComparer.OrdinalIgnoreCase); for(int i=0;i<sceneItems.Count;i++){ SceneLite si=sceneItems[i]; if(si==null || si.package==null) continue; if(activeCat=="Favorites"){ if(!favoriteUids.Contains(si.package.uid) && !favoriteScenes.Contains(SceneRef(si.package, si.entryPath))) continue; } else if(activeCat!="Scenes" && activeCat!="Favorites") continue; if(!MatchesAuthor(si.package)) continue; if(q!="" && si.name.ToLowerInvariant().IndexOf(q)<0 && si.entryPath.ToLowerInvariant().IndexOf(q)<0 && si.package.uid.ToLowerInvariant().IndexOf(q)<0) continue; string key=Group(si.package.uid)+"|"+si.entryPath; if(!seen.Add(key)) continue; l.Add(si); } return l; }
     private void RefreshList(){
         if(listContent==null)return;
         StopThumbLoadCoroutine(); ClearListThumbs();
@@ -2465,7 +3422,18 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         if(statusText!=null) statusText.text=OneLine(status,160);
         sw.Stop(); DebugLog("RefreshPresetList shell built. total="+total+", shown="+(end-start)+", varThumbs="+thumbQueue.Count+", ms="+sw.Elapsed.TotalMilliseconds.ToString("0"));
     }
-    private void RefreshSceneList(){ List<SceneLite> sl=FilteredScenes(); int total=sl.Count; int max=total==0?0:(total-1)/pageSize; if(page<0)page=0;if(page>max)page=max; SaveCurrentPageState(); int start=page*pageSize,end=Math.Min(start+pageSize,total); for(int i=start;i<end;i++) CreateSceneCard(sl[i]); if(selectedSceneItem!=null && !ContainsScene(sl, selectedSceneItem)) ClearSelectionKeepPreview(false); ShowEmptyState(total==0); UpdateResultToolbar("场景" + (activeCat=="Favorites"?" / "+FavSubLabel(favSubCat):""), total, start, end, max); if(statusText!=null) statusText.text=OneLine(status,160); }
+    private void RefreshSceneList(){
+        Stopwatch sw=Stopwatch.StartNew();
+        List<SceneLite> sl=FilteredScenes(); int total=sl.Count; int max=total==0?0:(total-1)/pageSize;
+        if(page<0)page=0;if(page>max)page=max; SaveCurrentPageState(); int start=page*pageSize,end=Math.Min(start+pageSize,total);
+        List<KeyValuePair<PackageLite,Image>> thumbQueue=new List<KeyValuePair<PackageLite,Image>>();
+        for(int i=start;i<end;i++){ Image thumb=CreateSceneCard(sl[i]); if(thumb!=null)thumbQueue.Add(new KeyValuePair<PackageLite,Image>(sl[i].package,thumb)); }
+        if(thumbQueue.Count>0)thumbLoadCoroutine=StartCoroutine(LoadThumbsAsync(thumbQueue));
+        if(selectedSceneItem!=null && !ContainsScene(sl, selectedSceneItem)) ClearSelectionKeepPreview(false);
+        ShowEmptyState(total==0); UpdateResultToolbar("场景" + (activeCat=="Favorites"?" / "+FavSubLabel(favSubCat):""), total, start, end, max);
+        if(statusText!=null) statusText.text=OneLine(status,160);
+        sw.Stop(); DebugLog("RefreshSceneList shell built. total="+total+", shown="+(end-start)+", thumbs="+thumbQueue.Count+", ms="+sw.Elapsed.TotalMilliseconds.ToString("0"));
+    }
 
     private string FavSubLabel(string sub) { if(sub=="All") return "全部"; if(sub=="Scenes") return "场景"; if(sub=="Looks") return "外观包"; if(sub=="Scripts") return "脚本"; if(sub=="Presets") return "本地/包内预设"; return sub; }
 
@@ -2477,6 +3445,7 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
 
         private void BuildSubBarButtons() {
         if (subBarRoot == null) return;
+        CloseAuthorDropdown();
         favSubBtns.Clear();
         var kids = new List<GameObject>();
         foreach (Transform c in subBarRoot.transform) kids.Add(c.gameObject);
@@ -2490,6 +3459,8 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         resultCountText = MakeText(labelObj.transform, "L", CatLabel(activeCat), 14, TextAnchor.MiddleLeft, colTextSecondary);
         resultCountText.rectTransform.anchorMin = Vector2.zero; resultCountText.rectTransform.anchorMax = Vector2.one;
         resultCountText.rectTransform.offsetMin = Vector2.zero; resultCountText.rectTransform.offsetMax = Vector2.zero;
+
+        AddAuthorFilterControl();
 
         if (activeCat == "Favorites") {
             string[] subs = new string[]{"All","Scenes","Looks","Scripts","Presets"};
@@ -2512,6 +3483,146 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
                 AddToolbarChip(n + "/页", pageSize == n, () => SetPageSize(n));
             }
         }
+    }
+
+    private void AddAuthorFilterControl() {
+        if (subBarRoot == null) return;
+        string label = HasAuthorFilter() ? "作者：" + OneLine(authorFilter, 16) + " ▼" : "作者：全部 ▼";
+        Button btn = MakeButton(subBarRoot.transform, label, 13, HasAuthorFilter() ? colAccentDim : colBtn);
+        LayoutElement le = btn.gameObject.AddComponent<LayoutElement>();
+        le.preferredWidth = isVRMode ? 190f : 160f;
+        le.minWidth = isVRMode ? 160f : 140f;
+        le.preferredHeight = isVRMode ? 36f : 28f;
+        btn.onClick.AddListener(() => ToggleAuthorDropdown());
+    }
+
+    private Dictionary<string, int> GetAuthorCounts() {
+        Dictionary<string, int> counts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        for (int i = 0; i < all.Count; i++) {
+            string author = PackageAuthor(all[i]);
+            int n;
+            counts.TryGetValue(author, out n);
+            counts[author] = n + 1;
+        }
+        return counts;
+    }
+
+    private void ToggleAuthorDropdown() {
+        if (authorDropdownRoot != null) { CloseAuthorDropdown(); return; }
+        if (root == null) return;
+
+        authorDropdownRoot = new GameObject("AuthorDropdown");
+        authorDropdownRoot.transform.SetParent(root.transform, false);
+        Image bg = authorDropdownRoot.AddComponent<Image>();
+        bg.color = new Color(0.10f, 0.12f, 0.16f, 0.99f);
+        RectTransform rt = authorDropdownRoot.GetComponent<RectTransform>();
+        rt.anchorMin = new Vector2(isVRMode ? 0.14f : 0.12f, isVRMode ? 0.16f : 0.18f);
+        rt.anchorMax = new Vector2(isVRMode ? 0.67f : 0.70f, isVRMode ? 0.84f : 0.82f);
+        rt.offsetMin = Vector2.zero; rt.offsetMax = Vector2.zero;
+        authorDropdownRoot.transform.SetAsLastSibling();
+
+        Text title = MakeText(authorDropdownRoot.transform, "Title", "按作者筛选", isVRMode ? 19 : 17, TextAnchor.MiddleLeft, colTextPrimary);
+        RectTransform titleRt = title.rectTransform;
+        titleRt.anchorMin = new Vector2(0, 1); titleRt.anchorMax = new Vector2(1, 1);
+        titleRt.pivot = new Vector2(0.5f, 1); titleRt.offsetMin = new Vector2(14, -42); titleRt.offsetMax = new Vector2(-60, -6);
+
+        Button close = MakeButton(authorDropdownRoot.transform, "×", 18, colBtn);
+        RectTransform closeRt = close.GetComponent<RectTransform>();
+        closeRt.anchorMin = new Vector2(1, 1); closeRt.anchorMax = new Vector2(1, 1);
+        closeRt.pivot = new Vector2(1, 1); closeRt.anchoredPosition = new Vector2(-10, -8); closeRt.sizeDelta = new Vector2(38, 32);
+        close.onClick.AddListener(() => CloseAuthorDropdown());
+
+        GameObject searchObj = new GameObject("AuthorSearch");
+        searchObj.transform.SetParent(authorDropdownRoot.transform, false);
+        Image searchBg = searchObj.AddComponent<Image>(); searchBg.color = colScrollBg;
+        RectTransform searchRt = searchObj.GetComponent<RectTransform>();
+        searchRt.anchorMin = new Vector2(0, 1); searchRt.anchorMax = new Vector2(1, 1);
+        searchRt.pivot = new Vector2(0.5f, 1); searchRt.offsetMin = new Vector2(12, -84); searchRt.offsetMax = new Vector2(-12, -48);
+        authorDropdownSearchInput = searchObj.AddComponent<InputField>();
+        Text inputText = MakeText(searchObj.transform, "Text", "", 14, TextAnchor.MiddleLeft, colTextPrimary);
+        StretchFull(inputText.rectTransform, 10, 10, 4, 4);
+        Text placeholder = MakeText(searchObj.transform, "Placeholder", "输入作者名筛选…", 14, TextAnchor.MiddleLeft, colTextDim);
+        StretchFull(placeholder.rectTransform, 10, 10, 4, 4);
+        authorDropdownSearchInput.textComponent = inputText;
+        authorDropdownSearchInput.placeholder = placeholder;
+        authorDropdownSearchInput.onValueChanged.AddListener((string value) => RefreshAuthorDropdownRows());
+
+        GameObject scrollObj = new GameObject("AuthorScroll");
+        scrollObj.transform.SetParent(authorDropdownRoot.transform, false);
+        RectTransform scrollRt = scrollObj.AddComponent<RectTransform>();
+        scrollRt.anchorMin = Vector2.zero; scrollRt.anchorMax = new Vector2(1, 1);
+        scrollRt.offsetMin = new Vector2(12, 12); scrollRt.offsetMax = new Vector2(-12, -92);
+        ScrollRect scroll = scrollObj.AddComponent<ScrollRect>();
+        scroll.horizontal = false; scroll.scrollSensitivity = 24f;
+        Image scrollBg = scrollObj.AddComponent<Image>(); scrollBg.color = new Color(0.08f, 0.10f, 0.14f, 0.90f);
+        GameObject viewport = new GameObject("Viewport");
+        viewport.transform.SetParent(scrollObj.transform, false);
+        RectTransform viewportRt = viewport.AddComponent<RectTransform>(); StretchFull(viewportRt, 2, 2, 2, 2);
+        viewport.AddComponent<Image>().color = new Color(0, 0, 0, 0.01f);
+        viewport.AddComponent<Mask>().showMaskGraphic = false;
+        GameObject content = new GameObject("Content");
+        content.transform.SetParent(viewport.transform, false);
+        RectTransform contentRt = content.AddComponent<RectTransform>();
+        contentRt.anchorMin = new Vector2(0, 1); contentRt.anchorMax = new Vector2(1, 1); contentRt.pivot = new Vector2(0.5f, 1);
+        contentRt.offsetMin = Vector2.zero; contentRt.offsetMax = Vector2.zero;
+        VerticalLayoutGroup vlg = content.AddComponent<VerticalLayoutGroup>();
+        vlg.spacing = 3; vlg.padding = new RectOffset(4, 4, 4, 4); vlg.childAlignment = TextAnchor.UpperCenter;
+        vlg.childControlWidth = true; vlg.childControlHeight = false; vlg.childForceExpandWidth = true; vlg.childForceExpandHeight = false;
+        content.AddComponent<ContentSizeFitter>().verticalFit = ContentSizeFitter.FitMode.PreferredSize;
+        scroll.viewport = viewportRt; scroll.content = contentRt;
+        authorDropdownContent = content.transform;
+        RefreshAuthorDropdownRows();
+    }
+
+    private void CloseAuthorDropdown() {
+        if (authorDropdownRoot != null) Destroy(authorDropdownRoot);
+        authorDropdownRoot = null;
+        authorDropdownContent = null;
+        authorDropdownSearchInput = null;
+    }
+
+    private void RefreshAuthorDropdownRows() {
+        if (authorDropdownContent == null) return;
+        List<GameObject> old = new List<GameObject>();
+        foreach (Transform c in authorDropdownContent) old.Add(c.gameObject);
+        for (int i = 0; i < old.Count; i++) Destroy(old[i]);
+
+        string query = authorDropdownSearchInput == null ? "" : (authorDropdownSearchInput.text ?? "").Trim();
+        Dictionary<string, int> counts = GetAuthorCounts();
+        List<string> authors = new List<string>(counts.Keys);
+        authors.Sort(StringComparer.OrdinalIgnoreCase);
+        AddAuthorDropdownRow("全部作者（" + all.Count + " 包）", "All", !HasAuthorFilter());
+        int shown = 0;
+        const int maxRows = 240;
+        for (int i = 0; i < authors.Count; i++) {
+            string author = authors[i];
+            if (query.Length > 0 && author.IndexOf(query, StringComparison.OrdinalIgnoreCase) < 0) continue;
+            if (shown >= maxRows) continue;
+            AddAuthorDropdownRow(author + "（" + counts[author] + " 包）", author, string.Equals(author, authorFilter, StringComparison.OrdinalIgnoreCase));
+            shown++;
+        }
+        if (shown == 0 && query.Length > 0) {
+            Text empty = MakeText(authorDropdownContent, "Empty", "没有匹配的作者", 14, TextAnchor.MiddleCenter, colTextDim);
+            SetFixedHeight(empty.gameObject, 34f);
+        } else if (shown >= maxRows) {
+            Text limit = MakeText(authorDropdownContent, "Limit", "匹配作者过多；请继续输入名称（最多显示 " + maxRows + " 项）", 12, TextAnchor.MiddleCenter, colTextDim);
+            SetFixedHeight(limit.gameObject, 34f);
+        }
+    }
+
+    private void AddAuthorDropdownRow(string label, string value, bool selectedValue) {
+        Button btn = MakeButton(authorDropdownContent, label, isVRMode ? 15 : 14, selectedValue ? colAccentDim : colBtn);
+        SetFixedHeight(btn.gameObject, isVRMode ? 42f : 34f);
+        btn.onClick.AddListener(() => {
+            authorFilter = value;
+            page = 0;
+            SaveCurrentPageState();
+            SaveConfig();
+            SetStatus(HasAuthorFilter() ? "作者筛选：" + authorFilter : "作者筛选：全部", false);
+            CloseAuthorDropdown();
+            ClearSelectionKeepPreview(false);
+            RefreshList();
+        });
     }
 
     private void AddToolbarChip(string label, bool selectedChip, UiAction action) {
@@ -2661,8 +3772,11 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
 
 
     private IEnumerator LoadThumbsAsync(List<KeyValuePair<PackageLite,Image>> queue) {
-        int perFrame = 4;
+        yield return null;
+        Stopwatch sw = Stopwatch.StartNew();
+        int perFrame = isVRMode ? 1 : 2;
         int count = 0;
+        int loaded = 0;
         for (int i = 0; i < queue.Count; i++) {
             PackageLite p = queue[i].Key;
             Image thumb = queue[i].Value;
@@ -2672,11 +3786,14 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
                 if (TryLoadPackageSprite(p, 5L * 1024L * 1024L, out tex, out sp)) {
                     thumb.sprite = sp; thumb.color = Color.white;
                     listThumbTextures.Add(tex); listThumbSprites.Add(sp);
+                    loaded++;
                 }
             } catch {}
             count++;
             if (count >= perFrame) { count = 0; yield return null; }
         }
+        sw.Stop();
+        DebugLog("Package thumbs loaded. requested="+queue.Count+", loaded="+loaded+", perFrame="+perFrame+", ms="+sw.Elapsed.TotalMilliseconds.ToString("0"));
         thumbLoadCoroutine = null;
     }
 
@@ -2745,6 +3862,7 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
 
     private void SelectPreset(PresetLite pr) {
         if (pr == null || details == null) return;
+        LeaveSceneSelection();
         selected = null;
         selectedPreset = pr;
         selectedVarPreset = null;
@@ -2857,6 +3975,7 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
 
     private void SelectVarPreset(VarPresetLite vp) {
         if (vp == null || details == null) return;
+        LeaveSceneSelection();
         selected = vp.package;
         selectedPreset = null;
         selectedVarPreset = vp;
@@ -2870,7 +3989,7 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         SetStatus("已选择包内预设 " + vp.name, false);
     }
     private void SelectVarPresetNoPreview(VarPresetLite vp) {
-        if(vp==null||details==null)return; selected=vp.package; selectedPreset=null; selectedVarPreset=vp; selectedSceneItem=null; ClearPreview();
+        if(vp==null||details==null)return; LeaveSceneSelection(); selected=vp.package; selectedPreset=null; selectedVarPreset=vp; selectedSceneItem=null; ClearPreview();
         details.text=vp.name+"\n\n类型："+vp.presetType+"预设\n包："+vp.package.uid+"\n预设条目："+vp.entryPath+"\n预览：点击卡片时加载\n大小："+FormatSize(vp.package.size)+"\n收藏："+(IsFavorite(vp.package)?"是":"否")+"\n\n这是 VaM "+vp.presetType+" Preset，会一次加载该预设中的整套内容。";
         details.color=colTextSecondary; UpdateAtomSelectorUI(); SetStatus("已选择包内预设 "+vp.name,false);
     }
@@ -2912,7 +4031,7 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
 
 
     private void SelectWearable(WearableLite w) {
-        if (w == null) return; selected = w.package; selectedPreset = null; selectedVarPreset = null; selectedSceneItem = null; selectedWearableItem = w; LoadEntryPreview(w.package, w.previewEntry);
+        if (w == null) return; LeaveSceneSelection(); selected = w.package; selectedPreset = null; selectedVarPreset = null; selectedSceneItem = null; selectedWearableItem = w; LoadEntryPreview(w.package, w.previewEntry);
         if (details != null) { details.text = w.name + "\n\n类型：" + CatLabel(w.wearableType) + "\n包：" + w.package.uid + "\n定义：" + w.entryPath + "\n预览：" + (w.previewEntry == "" ? "无" : w.previewEntry) + "\n\n这是包内真实的服装/头发项目，不是场景。点击“链接”后可在 VaM 原生服装/头发选择器中使用。"; details.color = colTextSecondary; }
         UpdateAtomSelectorUI(); UpdateInspectorVisibility(); SetStatus("已选择" + CatLabel(w.wearableType) + " " + w.name, false);
     }
@@ -2921,7 +4040,7 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
     }
     private void LoadEntryPreview(PackageLite p, string entry) { ClearPreview(); if (preview == null) return; Texture2D tex; Sprite sp; if (!TryLoadEntrySprite(p, entry, 12L * 1024L * 1024L, out tex, out sp)) return; previewTex = tex; previewSprite = sp; preview.sprite = sp; preview.color = Color.white; }
 
-        private void CreateSceneCard(SceneLite si) {
+        private Image CreateSceneCard(SceneLite si) {
         GameObject card = new GameObject("SceneCard_" + si.package.uid + "_" + si.name);
         card.transform.SetParent(listContent, false);
         bool fav = favoriteScenes.Contains(SceneRef(si.package, si.entryPath));
@@ -2953,11 +4072,8 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         thumb.preserveAspect = true;
         Rect(thumb.rectTransform, 8, 8, 154, 110);
 
-        Texture2D tex; Sprite sp;
-        if (TryLoadPackageSprite(si.package, 5L * 1024L * 1024L, out tex, out sp)) {
-            thumb.sprite = sp; thumb.color = Color.white;
-            listThumbTextures.Add(tex); listThumbSprites.Add(sp);
-        } else {
+        bool hasThumb = si.package != null && (!string.IsNullOrEmpty(si.package.thumbCache) || !string.IsNullOrEmpty(si.package.thumbEntry));
+        if (!hasThumb) {
             Text no = MakeText(thumbObj.transform, "NoThumb", "无预览", 12, TextAnchor.MiddleCenter, colTextDim);
             Rect(no.rectTransform, 0, 0, 154, 110);
         }
@@ -2972,23 +4088,556 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         Button favBtn = MakeButton(card.transform, fav ? "★" : "☆", 16, fav ? colAccent : new Color(1,1,1,0.55f));
         Rect(favBtn.GetComponent<RectTransform>(), 132, 8, 30, 28);
         favBtn.onClick.AddListener(() => ToggleSceneFavoriteItem(si));
+        return hasThumb ? thumb : null;
     }
 
 
 
     private void SelectSceneItem(SceneLite si) {
         if (si == null || details == null) return;
+        StopScenePrewarm(true);
         selected = si.package;
         selectedPreset = null;
         selectedVarPreset = null;
         selectedSceneItem = si;
         selectedWearableItem = null;
         LoadPreview(si.package);
-        details.text = si.name + "\n\n类型：Scene\n包：" + si.package.uid + "\n条目：" + si.entryPath + "\n收藏：" + (favoriteScenes.Contains(SceneRef(si.package, si.entryPath)) ? "是" : "否") + "\n\n包内场景";
-        details.color = colTextSecondary;
+        selectedSceneAnalysis = ReadAndAnalyzeScene(si.package, si.entryPath, "");
+        if (selectedSceneAnalysis != null && selectedSceneAnalysis.personIds.Count > 0
+            && !selectedSceneAnalysis.personIds.Contains(scenePrimaryPersonId)) scenePrimaryPersonId = selectedSceneAnalysis.personIds[0];
+        RefreshSelectedSceneDetails();
         UpdateAtomSelectorUI();
         UpdateInspectorVisibility();
         SetStatus("已选择场景 " + si.name, false);
+        StartSelectedScenePrewarm();
+    }
+
+    private string SceneAnalysisKey(PackageLite p, string scene) {
+        return (p == null ? "" : p.uid) + ":/" + Norm(scene ?? "");
+    }
+
+    private SceneJsonAnalysis ReadAndAnalyzeScene(PackageLite p, string scene, string knownJson) {
+        string key = SceneAnalysisKey(p, scene);
+        if (selectedSceneAnalysis != null && string.Equals(selectedSceneAnalysis.key, key, StringComparison.OrdinalIgnoreCase)
+            && !string.IsNullOrEmpty(selectedSceneAnalysis.json)) return selectedSceneAnalysis;
+        SceneJsonAnalysis analysis = new SceneJsonAnalysis();
+        analysis.key = key;
+        try {
+            string json = knownJson;
+            if (string.IsNullOrEmpty(json)) {
+                string ignoredCachePath;
+                if (!TryReadTimelineCache(p, scene, out json, out ignoredCachePath)) {
+                    byte[] data = ReadBytes(p, scene, 128L * 1024L * 1024L);
+                    if (data == null || data.Length == 0) { analysis.error = "场景 JSON 读取失败"; return analysis; }
+                    json = Encoding.UTF8.GetString(data);
+                }
+            }
+            analysis.json = json;
+            string error;
+            if (!TryAnalyzeSceneAtoms(json, analysis, out error)) analysis.error = error;
+            DebugLog("Scene analysis: key=" + key + ", bytes=" + Encoding.UTF8.GetByteCount(json) + ", atoms=" + analysis.atoms.Count + ", persons=" + analysis.personIds.Count + ", error=" + analysis.error);
+        } catch(Exception e) {
+            analysis.error = e.Message;
+            DebugLog("Scene analysis failed: key=" + key + " | " + e.ToString());
+        }
+        return analysis;
+    }
+
+    private void RefreshSelectedSceneDetails() {
+        if (selectedSceneItem == null || details == null) return;
+        SceneLite si = selectedSceneItem;
+        StringBuilder sb = new StringBuilder();
+        sb.Append(si.name).Append("\n\n类型：Scene\n包：").Append(si.package.uid)
+          .Append("\n条目：").Append(si.entryPath)
+          .Append("\n收藏：").Append(favoriteScenes.Contains(SceneRef(si.package, si.entryPath)) ? "是" : "否");
+        if (selectedSceneAnalysis != null) {
+            if (string.IsNullOrEmpty(selectedSceneAnalysis.error)) {
+                sb.Append("\nAtom：").Append(selectedSceneAnalysis.atoms.Count)
+                  .Append("  人物：").Append(selectedSceneAnalysis.personIds.Count);
+                if (!string.IsNullOrEmpty(scenePrimaryPersonId)) sb.Append("\n主角：").Append(scenePrimaryPersonId);
+                sb.Append("  模式：").Append(SceneLoadModeName(sceneLoadMode));
+            } else sb.Append("\n分析失败：").Append(selectedSceneAnalysis.error);
+        }
+        details.text = sb.ToString();
+        details.color = colTextSecondary;
+        UpdateSceneLoadModeUI();
+    }
+
+    private string SceneLoadModeName(int mode) {
+        if (mode == 1) return "人物优先";
+        if (mode == 2) return "极简人物";
+        return "完整";
+    }
+
+    private void SetSceneLoadMode(int mode) {
+        sceneLoadMode = Mathf.Clamp(mode, 0, 2);
+        SaveConfig();
+        UpdateSceneLoadModeUI();
+        RefreshSelectedSceneDetails();
+        SetStatus("场景加载模式：" + SceneLoadModeName(sceneLoadMode), true);
+    }
+
+    private void UpdateSceneLoadModeUI() {
+        SetModeButtonColor(sceneFullModeBtn, sceneLoadMode == 0);
+        SetModeButtonColor(scenePrimaryModeBtn, sceneLoadMode == 1);
+        SetModeButtonColor(sceneMinimalModeBtn, sceneLoadMode == 2);
+        if (scenePrimaryPersonLabel != null) scenePrimaryPersonLabel.text = "主角：" + (string.IsNullOrEmpty(scenePrimaryPersonId) ? "自动" : scenePrimaryPersonId);
+    }
+
+    private void SetModeButtonColor(Button button, bool selectedMode) {
+        if (button == null) return;
+        Image bg = button.GetComponent<Image>();
+        if (bg != null) bg.color = selectedMode ? colAccentDim : colBtn;
+    }
+
+    private void CycleScenePrimaryPerson() {
+        if (selectedSceneAnalysis == null || selectedSceneAnalysis.personIds.Count == 0) {
+            SetStatus("该场景没有可选择的人物 Atom。", false);
+            return;
+        }
+        int idx = selectedSceneAnalysis.personIds.IndexOf(scenePrimaryPersonId);
+        idx = (idx + 1) % selectedSceneAnalysis.personIds.Count;
+        scenePrimaryPersonId = selectedSceneAnalysis.personIds[idx];
+        RefreshSelectedSceneDetails();
+        StartSelectedScenePrewarm();
+        SetStatus("场景主角：" + scenePrimaryPersonId, true);
+    }
+
+    private void StartSelectedScenePrewarm() {
+        StopScenePrewarm(true);
+        if (!sceneTexturePrewarmEnabled || selectedSceneItem == null || selectedSceneAnalysis == null
+            || !string.IsNullOrEmpty(selectedSceneAnalysis.error) || string.IsNullOrEmpty(scenePrimaryPersonId)) return;
+        if (autoCleanLinksBeforeSceneLoad) {
+            DebugLog("Scene prewarm skipped because autoCleanLinksBeforeSceneLoad is enabled.");
+            return;
+        }
+        int generation = scenePrewarmGeneration;
+        string key = selectedSceneAnalysis.key;
+        scenePrewarmCoroutine = StartCoroutine(PrewarmSelectedSceneCoroutine(generation, key));
+    }
+
+    private IEnumerator PrewarmSelectedSceneCoroutine(int generation, string key) {
+        yield return new WaitForSecondsRealtime(0.75f);
+        scenePrewarmCoroutine = null;
+        if (generation != scenePrewarmGeneration || !sceneTexturePrewarmEnabled || selectedSceneAnalysis == null
+            || !string.Equals(selectedSceneAnalysis.key, key, StringComparison.OrdinalIgnoreCase) || selectedSceneItem == null) yield break;
+        Stopwatch sw = Stopwatch.StartNew();
+        int linked = 0, already = 0, missing = 0, errors = 0;
+        try {
+            LinkResult rootResult = LinkWithDeps(selectedSceneItem.package);
+            PresetLinkDiag directResult = AutoLinkSceneDepsDetailed(selectedSceneAnalysis.json);
+            linked = rootResult.created + directResult.linked;
+            already = rootResult.already + directResult.already;
+            missing = rootResult.missing.Count + directResult.missing.Count;
+            errors = rootResult.errors.Count + directResult.errors.Count;
+            if (linked > 0) RefreshVam();
+        } catch(Exception e) {
+            errors++;
+            DebugLog("Scene prewarm prelink failed: " + e.ToString());
+        }
+        yield return null;
+        if (generation != scenePrewarmGeneration || selectedSceneAnalysis == null
+            || !string.Equals(selectedSceneAnalysis.key, key, StringComparison.OrdinalIgnoreCase)) yield break;
+        string scenePackageUid = selectedSceneItem == null || selectedSceneItem.package == null ? "" : selectedSceneItem.package.uid;
+        int queued = QueuePrimaryPersonSkinPrewarm(selectedSceneAnalysis, scenePrimaryPersonId, scenePackageUid, generation);
+        sw.Stop();
+        scenePrewarmKey = key;
+        DebugLog("Scene prewarm queued: key=" + key + ", person=" + scenePrimaryPersonId + ", textures=" + queued + ", linked=" + linked + ", already=" + already + ", missing=" + missing + ", errors=" + errors + ", prepMs=" + sw.Elapsed.TotalMilliseconds.ToString("0"));
+        if (queued > 0) SetStatus("正在预热 " + scenePrimaryPersonId + " 的 " + queued + " 张皮肤纹理...", false);
+        else if (errors == 0) SetStatus("场景依赖已预链接，人物皮肤已在缓存或无需预热。", false);
+    }
+
+    private void StopScenePrewarm(bool cancelQueued) {
+        scenePrewarmGeneration++;
+        if (scenePrewarmCoroutine != null) {
+            try { StopCoroutine(scenePrewarmCoroutine); } catch {}
+            scenePrewarmCoroutine = null;
+        }
+        if (cancelQueued) {
+            for (int i = 0; i < activePrewarmImages.Count; i++) {
+                try { if (activePrewarmImages[i] != null && !activePrewarmImages[i].processed) activePrewarmImages[i].cancel = true; } catch {}
+            }
+        }
+        activePrewarmImages.Clear();
+        activePrewarmSignatures.Clear();
+        scenePrewarmPending = 0;
+        scenePrewarmErrors = 0;
+        scenePrewarmKey = "";
+    }
+
+    private int QueuePrimaryPersonSkinPrewarm(SceneJsonAnalysis analysis, string personId, string scenePackageUid, int generation) {
+        if (analysis == null || ImageLoaderThreaded.singleton == null || string.IsNullOrEmpty(personId)) return 0;
+        SceneAtomSpan person = null;
+        for (int i = 0; i < analysis.atoms.Count; i++) {
+            if (analysis.atoms[i].type == "Person" && string.Equals(analysis.atoms[i].id, personId, StringComparison.Ordinal)) { person = analysis.atoms[i]; break; }
+        }
+        if (person == null) return 0;
+        int queued = 0;
+        queued += QueueSkinFields(analysis.json, person, new string[] { "faceDiffuseUrl", "torsoDiffuseUrl", "limbsDiffuseUrl", "genitalsDiffuseUrl", "faceDecalUrl", "torsoDecalUrl", "limbsDecalUrl", "genitalsDecalUrl" }, false, false, scenePackageUid, generation, MaxScenePrewarmTextures - queued);
+        queued += QueueSkinFields(analysis.json, person, new string[] { "faceSpecularUrl", "torsoSpecularUrl", "limbsSpecularUrl", "genitalsSpecularUrl", "faceGlossUrl", "torsoGlossUrl", "limbsGlossUrl", "genitalsGlossUrl" }, true, false, scenePackageUid, generation, MaxScenePrewarmTextures - queued);
+        queued += QueueSkinFields(analysis.json, person, new string[] { "faceNormalUrl", "torsoNormalUrl", "limbsNormalUrl", "genitalsNormalUrl", "faceDetailUrl", "torsoDetailUrl", "limbsDetailUrl", "genitalsDetailUrl" }, true, true, scenePackageUid, generation, MaxScenePrewarmTextures - queued);
+        return queued;
+    }
+
+    private int QueueSkinFields(string json, SceneAtomSpan atom, string[] fields, bool linear, bool normal, string scenePackageUid, int generation, int maxToQueue) {
+        int queued = 0;
+        if (maxToQueue <= 0) return 0;
+        for (int i = 0; i < fields.Length; i++) {
+            List<string> values = FindJsonStringPropertyValues(json, atom.start, atom.start + atom.length, fields[i]);
+            for (int v = 0; v < values.Count; v++) {
+                if (QueueSkinTexturePrewarm(values[v], linear, normal, scenePackageUid, generation)) queued++;
+                if (queued >= maxToQueue) return queued;
+            }
+        }
+        return queued;
+    }
+
+    private bool QueueSkinTexturePrewarm(string path, bool linear, bool normal, string scenePackageUid, int generation) {
+        if (string.IsNullOrEmpty(path) || path == "NULL" || ImageLoaderThreaded.singleton == null) return false;
+        path = ResolveSceneTexturePrewarmPath(path, scenePackageUid);
+        ImageLoaderThreaded.QueuedImage qi = new ImageLoaderThreaded.QueuedImage();
+        qi.imgPath = path;
+        qi.createMipMaps = true;
+        qi.compress = true;
+        qi.linear = linear;
+        qi.isNormalMap = normal;
+        string signature = qi.cacheSignature;
+        try {
+            if (ImageLoaderThreaded.singleton.IsTextureCached(signature) || activePrewarmSignatures.Contains(signature)) return false;
+            activePrewarmSignatures.Add(signature);
+            activePrewarmImages.Add(qi);
+            scenePrewarmPending++;
+            qi.callback = delegate(ImageLoaderThreaded.QueuedImage loaded) { OnSceneTexturePrewarmed(loaded, signature, generation); };
+            ImageLoaderThreaded.singleton.PreloadImage(qi);
+            // PreloadImage does not invoke callbacks when the resolved texture is already cached.
+            if (ImageLoaderThreaded.singleton.IsTextureCached(qi.cacheSignature)) {
+                qi.callback = null;
+                activePrewarmSignatures.Remove(signature);
+                activePrewarmImages.Remove(qi);
+                scenePrewarmPending = Math.Max(0, scenePrewarmPending - 1);
+                return false;
+            }
+            return true;
+        } catch(Exception e) {
+            activePrewarmSignatures.Remove(signature);
+            activePrewarmImages.Remove(qi);
+            scenePrewarmPending = Math.Max(0, scenePrewarmPending - 1);
+            DebugLog("Texture prewarm queue failed: " + signature + " | " + e.Message);
+            return false;
+        }
+    }
+
+    private static string ResolveSceneTexturePrewarmPath(string path, string scenePackageUid) {
+        const string selfPrefix = "SELF:/";
+        if (!string.IsNullOrEmpty(scenePackageUid) && path.StartsWith(selfPrefix, StringComparison.OrdinalIgnoreCase))
+            path = scenePackageUid + ":/" + path.Substring(selfPrefix.Length);
+        if (path.IndexOf(".latest:", StringComparison.OrdinalIgnoreCase) >= 0) {
+            try {
+                string normalized = FileManager.NormalizeLoadPath(path);
+                if (!string.IsNullOrEmpty(normalized)) path = normalized;
+            } catch {}
+        }
+        return path;
+    }
+
+    private void OnSceneTexturePrewarmed(ImageLoaderThreaded.QueuedImage image, string signature, int generation) {
+        if (generation != scenePrewarmGeneration) return;
+        if (image == null || image.hadError) {
+            scenePrewarmErrors++;
+            DebugLog("Scene texture prewarm failed: " + signature + (image == null ? "" : " | " + image.errorText));
+        }
+        activePrewarmSignatures.Remove(signature);
+        activePrewarmImages.Remove(image);
+        scenePrewarmPending = Math.Max(0, scenePrewarmPending - 1);
+        if (scenePrewarmPending == 0) {
+            DebugLog("Scene prewarm complete: key=" + scenePrewarmKey);
+            SetStatus(scenePrewarmErrors == 0 ? "主人物皮肤预热完成。" : "主人物皮肤预热完成，失败 " + scenePrewarmErrors + " 张。", scenePrewarmErrors > 0);
+        }
+    }
+
+    private static bool TryAnalyzeSceneAtoms(string json, SceneJsonAnalysis analysis, out string error) {
+        error = "";
+        if (analysis == null || string.IsNullOrEmpty(json)) { error = "场景 JSON 为空"; return false; }
+        int atomsOpen;
+        if (!TryFindTopLevelArrayProperty(json, "atoms", out atomsOpen)) { error = "未找到顶层 atoms 数组"; return false; }
+        int atomsClose = FindMatchingJsonContainer(json, atomsOpen, '[', ']');
+        if (atomsClose < 0) { error = "atoms 数组没有闭合"; return false; }
+        analysis.atomsOpen = atomsOpen;
+        analysis.atomsClose = atomsClose;
+        int cursor = atomsOpen + 1;
+        while (cursor < atomsClose) {
+            while (cursor < atomsClose && (char.IsWhiteSpace(json[cursor]) || json[cursor] == ',')) cursor++;
+            if (cursor >= atomsClose) break;
+            if (json[cursor] != '{') { error = "atoms 数组包含非对象元素，位置 " + cursor; return false; }
+            int objectClose = FindMatchingJsonContainer(json, cursor, '{', '}');
+            if (objectClose < 0 || objectClose > atomsClose) { error = "Atom 对象没有闭合，位置 " + cursor; return false; }
+            SceneAtomSpan atom = new SceneAtomSpan();
+            atom.start = cursor;
+            atom.length = objectClose - cursor + 1;
+            TryFindDirectStringProperty(json, cursor, objectClose + 1, "id", out atom.id);
+            TryFindDirectStringProperty(json, cursor, objectClose + 1, "type", out atom.type);
+            analysis.atoms.Add(atom);
+            if (string.Equals(atom.type, "Person", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrEmpty(atom.id)) analysis.personIds.Add(atom.id);
+            cursor = objectClose + 1;
+        }
+        return true;
+    }
+
+    private static bool TryFindTopLevelArrayProperty(string json, string property, out int arrayOpen) {
+        arrayOpen = -1;
+        int objectDepth = 0, arrayDepth = 0, cursor = 0;
+        while (cursor < json.Length) {
+            char c = json[cursor];
+            if (c == '"') {
+                string token; int next;
+                if (!TryReadJsonString(json, cursor, json.Length, out token, out next)) return false;
+                if (objectDepth == 1 && arrayDepth == 0 && string.Equals(token, property, StringComparison.Ordinal)) {
+                    int p = next;
+                    while (p < json.Length && char.IsWhiteSpace(json[p])) p++;
+                    if (p < json.Length && json[p] == ':') p++;
+                    while (p < json.Length && char.IsWhiteSpace(json[p])) p++;
+                    if (p < json.Length && json[p] == '[') { arrayOpen = p; return true; }
+                }
+                cursor = next;
+                continue;
+            }
+            if (c == '{') objectDepth++;
+            else if (c == '}') objectDepth--;
+            else if (c == '[') arrayDepth++;
+            else if (c == ']') arrayDepth--;
+            cursor++;
+        }
+        return false;
+    }
+
+    private static int FindMatchingJsonContainer(string json, int openAt, char open, char close) {
+        int depth = 0, cursor = openAt;
+        while (cursor < json.Length) {
+            char c = json[cursor];
+            if (c == '"') {
+                string ignored; int next;
+                if (!TryReadJsonString(json, cursor, json.Length, out ignored, out next)) return -1;
+                cursor = next;
+                continue;
+            }
+            if (c == open) depth++;
+            else if (c == close) {
+                depth--;
+                if (depth == 0) return cursor;
+            }
+            cursor++;
+        }
+        return -1;
+    }
+
+    private static bool TryFindDirectStringProperty(string json, int start, int end, string property, out string value) {
+        value = "";
+        int objectDepth = 0, arrayDepth = 0, cursor = start;
+        while (cursor < end) {
+            char c = json[cursor];
+            if (c == '"') {
+                string token; int next;
+                if (!TryReadJsonString(json, cursor, end, out token, out next)) return false;
+                if (objectDepth == 1 && arrayDepth == 0 && string.Equals(token, property, StringComparison.Ordinal)) {
+                    int p = next;
+                    while (p < end && char.IsWhiteSpace(json[p])) p++;
+                    if (p < end && json[p] == ':') p++;
+                    while (p < end && char.IsWhiteSpace(json[p])) p++;
+                    int after;
+                    if (p < end && json[p] == '"' && TryReadJsonString(json, p, end, out value, out after)) return true;
+                }
+                cursor = next;
+                continue;
+            }
+            if (c == '{') objectDepth++;
+            else if (c == '}') objectDepth--;
+            else if (c == '[') arrayDepth++;
+            else if (c == ']') arrayDepth--;
+            cursor++;
+        }
+        return false;
+    }
+
+    private static bool TryReadJsonString(string json, int quoteAt, int limit, out string value, out int next) {
+        value = ""; next = quoteAt;
+        if (quoteAt < 0 || quoteAt >= limit || json[quoteAt] != '"') return false;
+        StringBuilder sb = new StringBuilder();
+        int cursor = quoteAt + 1;
+        while (cursor < limit) {
+            char c = json[cursor++];
+            if (c == '"') { value = sb.ToString(); next = cursor; return true; }
+            if (c != '\\') { sb.Append(c); continue; }
+            if (cursor >= limit) return false;
+            char esc = json[cursor++];
+            if (esc == '"' || esc == '\\' || esc == '/') sb.Append(esc);
+            else if (esc == 'b') sb.Append('\b');
+            else if (esc == 'f') sb.Append('\f');
+            else if (esc == 'n') sb.Append('\n');
+            else if (esc == 'r') sb.Append('\r');
+            else if (esc == 't') sb.Append('\t');
+            else if (esc == 'u') {
+                if (cursor + 4 > limit) return false;
+                int code = 0;
+                for (int i = 0; i < 4; i++) {
+                    char h = json[cursor++];
+                    int digit = h >= '0' && h <= '9' ? h - '0' : h >= 'a' && h <= 'f' ? h - 'a' + 10 : h >= 'A' && h <= 'F' ? h - 'A' + 10 : -1;
+                    if (digit < 0) return false;
+                    code = code * 16 + digit;
+                }
+                sb.Append((char)code);
+            } else return false;
+        }
+        return false;
+    }
+
+    private static List<string> FindJsonStringPropertyValues(string json, int start, int end, string property) {
+        List<string> result = new List<string>();
+        int cursor = Math.Max(0, start);
+        end = Math.Min(end, json == null ? 0 : json.Length);
+        while (cursor < end) {
+            if (json[cursor] != '"') { cursor++; continue; }
+            string key; int next;
+            if (!TryReadJsonString(json, cursor, end, out key, out next)) break;
+            int p = next;
+            while (p < end && char.IsWhiteSpace(json[p])) p++;
+            if (p < end && json[p] == ':' && string.Equals(key, property, StringComparison.OrdinalIgnoreCase)) {
+                p++;
+                while (p < end && char.IsWhiteSpace(json[p])) p++;
+                string value; int after;
+                if (p < end && json[p] == '"' && TryReadJsonString(json, p, end, out value, out after)) {
+                    if (!string.IsNullOrEmpty(value) && !result.Contains(value)) result.Add(value);
+                    cursor = after;
+                    continue;
+                }
+            }
+            cursor = next;
+        }
+        return result;
+    }
+
+    private static HashSet<string> FindAtomReferences(string json, SceneAtomSpan atom, HashSet<string> knownIds) {
+        HashSet<string> result = new HashSet<string>(StringComparer.Ordinal);
+        HashSet<string> referenceKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "receiverAtom", "parentAtom", "atom", "atomUid", "atomUID", "sourceAtom" };
+        int cursor = atom.start, end = atom.start + atom.length;
+        while (cursor < end) {
+            if (json[cursor] != '"') { cursor++; continue; }
+            string key; int next;
+            if (!TryReadJsonString(json, cursor, end, out key, out next)) break;
+            int p = next;
+            while (p < end && char.IsWhiteSpace(json[p])) p++;
+            if (p < end && json[p] == ':' && referenceKeys.Contains(key)) {
+                p++;
+                while (p < end && char.IsWhiteSpace(json[p])) p++;
+                string value; int after;
+                if (p < end && json[p] == '"' && TryReadJsonString(json, p, end, out value, out after)) {
+                    if (knownIds.Contains(value)) result.Add(value);
+                    cursor = after;
+                    continue;
+                }
+            }
+            cursor = next;
+        }
+        return result;
+    }
+
+    private static bool TryBuildSceneVariants(SceneJsonAnalysis analysis, int mode, string primaryPersonId, out SceneVariantResult result, out string error) {
+        result = new SceneVariantResult(); error = "";
+        if (analysis == null || !string.IsNullOrEmpty(analysis.error) || analysis.atomsOpen < 0 || analysis.atomsClose < 0) { error = "场景结构尚未成功分析"; return false; }
+        if (mode <= 0) { result.primaryJson = analysis.json; result.totalAtoms = result.keptAtoms = analysis.atoms.Count; return true; }
+        SceneAtomSpan primary = null;
+        HashSet<string> knownIds = new HashSet<string>(StringComparer.Ordinal);
+        for (int i = 0; i < analysis.atoms.Count; i++) {
+            if (!string.IsNullOrEmpty(analysis.atoms[i].id)) knownIds.Add(analysis.atoms[i].id);
+            if (string.Equals(analysis.atoms[i].type, "Person", StringComparison.OrdinalIgnoreCase) && string.Equals(analysis.atoms[i].id, primaryPersonId, StringComparison.Ordinal)) primary = analysis.atoms[i];
+        }
+        if (primary == null) { error = "没有找到主角 Person：" + primaryPersonId; return false; }
+        HashSet<string> related = new HashSet<string>(StringComparer.Ordinal);
+        if (mode == 1) {
+            for (int i = 0; i < analysis.atoms.Count; i++) {
+                SceneAtomSpan atom = analysis.atoms[i];
+                if (!string.Equals(atom.type, "Person", StringComparison.OrdinalIgnoreCase) || string.IsNullOrEmpty(atom.id)) continue;
+                related.Add(atom.id);
+                related.UnionWith(FindAtomReferences(analysis.json, atom, knownIds));
+            }
+            bool changed = true;
+            while (changed) {
+                changed = false;
+                for (int i = 0; i < analysis.atoms.Count; i++) {
+                    SceneAtomSpan atom = analysis.atoms[i];
+                    if (related.Contains(atom.id)) continue;
+                    List<string> parents = FindJsonStringPropertyValues(analysis.json, atom.start, atom.start + atom.length, "parentAtom");
+                    for (int p = 0; p < parents.Count; p++) {
+                        if (related.Contains(parents[p])) { related.Add(atom.id); changed = true; break; }
+                    }
+                }
+            }
+        } else {
+            related.UnionWith(FindAtomReferences(analysis.json, primary, knownIds));
+            related.Add(primaryPersonId);
+        }
+        List<SceneAtomSpan> kept = new List<SceneAtomSpan>();
+        List<SceneAtomSpan> deferred = new List<SceneAtomSpan>();
+        Dictionary<string,int> deferredTypeCounts = new Dictionary<string,int>(StringComparer.OrdinalIgnoreCase);
+        for (int i = 0; i < analysis.atoms.Count; i++) {
+            SceneAtomSpan atom = analysis.atoms[i];
+            bool keep = ShouldKeepSceneAtom(atom, mode, primaryPersonId, related);
+            if (keep) kept.Add(atom);
+            else {
+                deferred.Add(atom);
+                string type = string.IsNullOrEmpty(atom.type) ? "Unknown" : atom.type;
+                int count; deferredTypeCounts.TryGetValue(type, out count); deferredTypeCounts[type] = count + 1;
+            }
+        }
+        result.totalAtoms = analysis.atoms.Count;
+        result.keptAtoms = kept.Count;
+        result.deferredAtoms = deferred.Count;
+        result.primaryJson = BuildSceneJsonWithAtoms(analysis, kept);
+        if (deferred.Count > 0) result.deferredJson = BuildSceneJsonWithAtoms(analysis, deferred);
+        List<string> types = new List<string>(deferredTypeCounts.Keys);
+        types.Sort(StringComparer.OrdinalIgnoreCase);
+        for (int i = 0; i < types.Count; i++) result.deferredTypes.Add(types[i] + "x" + deferredTypeCounts[types[i]]);
+        return true;
+    }
+
+    private static bool ShouldKeepSceneAtom(SceneAtomSpan atom, int mode, string primaryPersonId, HashSet<string> related) {
+        string type = atom.type ?? "";
+        if (string.Equals(type, "Person", StringComparison.OrdinalIgnoreCase)) return mode == 1 || string.Equals(atom.id, primaryPersonId, StringComparison.Ordinal);
+        if (IsSystemSceneAtomType(type) || IsLightSceneAtomType(type)) return true;
+        if (mode >= 2) return false;
+        if (related.Contains(atom.id)) return true;
+        return !IsHeavyOptionalSceneAtomType(type);
+    }
+
+    private static bool IsSystemSceneAtomType(string type) {
+        return string.Equals(type, "WindowCamera", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(type, "PlayerNavigationPanel", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(type, "CoreControl", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(type, "VRController", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsLightSceneAtomType(string type) {
+        return !string.IsNullOrEmpty(type) && type.EndsWith("Light", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsHeavyOptionalSceneAtomType(string type) {
+        return string.Equals(type, "CustomUnityAsset", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(type, "SubScene", StringComparison.OrdinalIgnoreCase)
+            || type.IndexOf("AudioSource", StringComparison.OrdinalIgnoreCase) >= 0
+            || type.IndexOf("Video", StringComparison.OrdinalIgnoreCase) >= 0
+            || type.IndexOf("Browser", StringComparison.OrdinalIgnoreCase) >= 0;
+    }
+
+    private static string BuildSceneJsonWithAtoms(SceneJsonAnalysis analysis, List<SceneAtomSpan> atoms) {
+        int capacity = analysis.atomsOpen + 1 + (analysis.json.Length - analysis.atomsClose) + Math.Max(0, atoms.Count - 1);
+        for (int i = 0; i < atoms.Count; i++) capacity += atoms[i].length;
+        StringBuilder sb = new StringBuilder(capacity);
+        sb.Append(analysis.json, 0, analysis.atomsOpen + 1);
+        for (int i = 0; i < atoms.Count; i++) {
+            if (i > 0) sb.Append(',');
+            sb.Append(analysis.json, atoms[i].start, atoms[i].length);
+        }
+        sb.Append(analysis.json, analysis.atomsClose, analysis.json.Length - analysis.atomsClose);
+        return sb.ToString();
     }
 
     private void ToggleSceneFavoriteItem(SceneLite si) {
@@ -3122,27 +4771,13 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
     }
 
     private void EnsureVarPresetIndex() {
+        Stopwatch sw = Stopwatch.StartNew();
         varPresets.Clear();
+        int packagesWithSpecs = 0;
         for (int i = 0; i < all.Count; i++) {
             PackageLite p = all[i];
-            if (p == null) continue;
-            if (p.presetSpecs == null || p.presetSpecs.Count == 0) {
-                if (!p.cats.Contains("Looks") && !p.cats.Contains("Presets")) continue;
-                try {
-                    ZipFile zip = new ZipFile(p.fullPath);
-                    try {
-                        IEnumerator en = zip.GetEnumerator();
-                        while (en.MoveNext()) {
-                            ZipEntry e = en.Current as ZipEntry;
-                            if (e == null || !e.IsFile) continue;
-                            string n = Norm(e.Name);
-                            if (!IsPersonPresetPath(n)) continue;
-                            string spec = MakePresetSpec(DetectPresetTypeFromPath(n), n);
-                            if (!p.presetSpecs.Contains(spec)) p.presetSpecs.Add(spec);
-                        }
-                    } finally { zip.Close(); }
-                } catch {}
-            }
+            if (p == null || p.presetSpecs == null || p.presetSpecs.Count == 0) continue;
+            packagesWithSpecs++;
             for (int j = 0; j < p.presetSpecs.Count; j++) {
                 string spec = p.presetSpecs[j];
                 string entryPath = PresetSpecPath(spec);
@@ -3161,6 +4796,8 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
             if (c != 0) return c;
             return string.Compare(a.package.uid, b.package.uid, StringComparison.OrdinalIgnoreCase);
         });
+        sw.Stop();
+        DebugLog("Var preset index built from cache. packages="+packagesWithSpecs+", presets="+varPresets.Count+", ms="+sw.Elapsed.TotalMilliseconds.ToString("0"));
     }
 
     private void EnsureSceneIndex() {
@@ -3791,12 +5428,156 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
             CancelInvoke("PatchLoadedPackageScriptPluginUrls");
             Invoke("PatchLoadedPackageScriptPluginUrls", 0.5f);
             Invoke("PatchLoadedPackageScriptPluginUrls", 1.5f);
+            QueueTargetAtomPluginPanel(atom, newPlugin);
 
             SetStatus("已加载脚本 " + selected.uid + " 到 " + targetAtomUid + " [" + scriptEntry + "]", true);
             DebugLog("LoadScriptToAtom OK: " + selected.uid + ":/" + scriptEntry + " => " + pluginUrl + " -> " + targetAtomUid);
         } catch (Exception e) {
             SetStatus("加载脚本失败：" + e.Message, true);
             DebugLog("LoadScriptToAtom FAILED: " + e.ToString());
+        }
+    }
+
+    private void QueueTargetAtomPluginPanel(Atom atom, MVRPlugin plugin) {
+        if (!autoOpenTargetAtomPluginPanel || atom == null || plugin == null) return;
+        pendingPluginPanelAtomUid = atom.uid ?? "";
+        pendingPluginPanelSlotUid = plugin.uid ?? "";
+        pendingPluginPanelRetryCount = 0;
+        if (string.IsNullOrEmpty(pendingPluginPanelAtomUid) || string.IsNullOrEmpty(pendingPluginPanelSlotUid)) {
+            DebugLog("QueueTargetAtomPluginPanel skipped: target atom or plugin slot has no uid.");
+            return;
+        }
+        CancelInvoke("TryOpenTargetAtomPluginPanel");
+        Invoke("TryOpenTargetAtomPluginPanel", 0.75f);
+        DebugLog("Queued native target-atom plugin panel: atom=" + pendingPluginPanelAtomUid + ", slot=" + pendingPluginPanelSlotUid);
+    }
+
+    private void RetryTargetAtomPluginPanel(string reason) {
+        if (pendingPluginPanelRetryCount >= MaxPendingPluginPanelRetries) {
+            DebugLog("Target-atom plugin panel gave up after " + pendingPluginPanelRetryCount + " retries: " + reason);
+            pendingPluginPanelAtomUid = "";
+            pendingPluginPanelSlotUid = "";
+            return;
+        }
+        pendingPluginPanelRetryCount++;
+        DebugLog("Target-atom plugin panel waiting (" + pendingPluginPanelRetryCount + "/" + MaxPendingPluginPanelRetries + "): " + reason);
+        Invoke("TryOpenTargetAtomPluginPanel", 0.5f);
+    }
+
+    private MVRPlugin FindPluginSlotByUid(MVRPluginManager pluginMgr, string uid) {
+        if (pluginMgr == null || string.IsNullOrEmpty(uid)) return null;
+        List<MVRPlugin> slots = GetPluginSlots(pluginMgr);
+        for (int i = 0; i < slots.Count; i++) {
+            if (slots[i] != null && string.Equals(slots[i].uid, uid, StringComparison.OrdinalIgnoreCase)) return slots[i];
+        }
+        return null;
+    }
+
+    private bool TryClickNativePluginsButton(Transform rootTransform) {
+        if (rootTransform == null) return false;
+        try {
+            Button[] buttons = rootTransform.GetComponentsInChildren<Button>(true);
+            for (int i = 0; i < buttons.Length; i++) {
+                Button button = buttons[i];
+                if (button == null || !button.interactable) continue;
+                Text label = button.GetComponentInChildren<Text>(true);
+                string text = label == null ? "" : (label.text ?? "").Trim();
+                string objectName = button.gameObject.name ?? "";
+                // Match only the tab itself.  Do not use a broad "contains Plugin"
+                // check here: plugin management panels also have destructive buttons.
+                bool isPluginsTab = string.Equals(text, "Plugins", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(text, "Plugin", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(objectName, "Plugins", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(objectName, "Plugin", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(objectName, "PluginsButton", StringComparison.OrdinalIgnoreCase);
+                if (!isPluginsTab) continue;
+                button.onClick.Invoke();
+                DebugLog("Opened VaM native Plugins tab via button: " + (text.Length > 0 ? text : objectName));
+                return true;
+            }
+        } catch (Exception e) { DebugLog("TryClickNativePluginsButton failed: " + e.Message); }
+        return false;
+    }
+
+    private void SetTransformActiveUpTo(Transform child, Transform boundary) {
+        if (child == null) return;
+        Transform current = child;
+        // Do not walk into the complete HUD hierarchy if the expected boundary
+        // is not an ancestor.  The plugin list itself is still made visible.
+        bool bounded = boundary != null && (current == boundary || current.IsChildOf(boundary));
+        for (int depth = 0; current != null && depth < 32; depth++) {
+            current.gameObject.SetActive(true);
+            if (bounded && current == boundary) break;
+            if (!bounded) break;
+            current = current.parent;
+        }
+    }
+
+    private bool ForceOpenNativePluginPanel(MVRPluginManager pluginMgr, MVRPlugin plugin) {
+        if (pluginMgr == null) return false;
+        try {
+            // InitUI is VaM's own wiring step.  It attaches configUI and every
+            // script customUI to MVRPluginManagerUI.pluginListPanel/scriptUIParent.
+            pluginMgr.InitUI();
+            Transform listPanel = pluginMgr.pluginListPanel;
+            if (listPanel == null) {
+                DebugLog("Native plugin panel unavailable: MVRPluginManager.InitUI left pluginListPanel null.");
+                return false;
+            }
+            SetTransformActiveUpTo(listPanel, pluginMgr.UITransform);
+            if (pluginMgr.scriptUIParent != null) SetTransformActiveUpTo(pluginMgr.scriptUIParent, pluginMgr.UITransform);
+            if (plugin != null && plugin.configUI != null) SetTransformActiveUpTo(plugin.configUI, listPanel);
+            DebugLog("Native plugin panel forced visible: panel=" + listPanel.name + ", active=" + listPanel.gameObject.activeInHierarchy + ", pluginUi=" + (plugin == null || plugin.configUI == null ? "-" : plugin.configUI.gameObject.activeInHierarchy.ToString()));
+            return listPanel.gameObject.activeInHierarchy;
+        } catch (Exception e) {
+            DebugLog("ForceOpenNativePluginPanel failed: " + e.ToString());
+            return false;
+        }
+    }
+
+    private void TryOpenTargetAtomPluginPanel() {
+        if (!autoOpenTargetAtomPluginPanel || string.IsNullOrEmpty(pendingPluginPanelAtomUid) || string.IsNullOrEmpty(pendingPluginPanelSlotUid)) return;
+        try {
+            SuperController sc = SuperController.singleton;
+            if (sc == null) { RetryTargetAtomPluginPanel("SuperController not ready"); return; }
+            Atom atom = sc.GetAtomByUid(pendingPluginPanelAtomUid);
+            if (atom == null) { RetryTargetAtomPluginPanel("target atom not found: " + pendingPluginPanelAtomUid); return; }
+            MVRPluginManager pluginMgr = atom.GetStorableByID("PluginManager") as MVRPluginManager;
+            if (pluginMgr == null) { RetryTargetAtomPluginPanel("target atom has no PluginManager"); return; }
+            MVRPlugin plugin = FindPluginSlotByUid(pluginMgr, pendingPluginPanelSlotUid);
+            if (plugin == null) { RetryTargetAtomPluginPanel("plugin slot not created yet"); return; }
+            if (plugin.scriptControllers == null || plugin.scriptControllers.Count == 0) {
+                RetryTargetAtomPluginPanel("script is still loading");
+                return;
+            }
+
+            // The custom library canvas otherwise sits in front of VaM's HUD.
+            if (canvas != null) ClosePanel();
+            if (atom.mainController == null) { RetryTargetAtomPluginPanel("target atom main controller not ready"); return; }
+            sc.SelectController(atom.mainController, false, false, false, true);
+            sc.ShowMainHUDAuto();
+
+            bool nativePanelOpened = ForceOpenNativePluginPanel(pluginMgr, plugin);
+            // Older VaM UI skins can expose a real Plugins tab instead; retain a
+            // narrow, non-destructive fallback for those layouts.
+            if (!nativePanelOpened) nativePanelOpened = TryClickNativePluginsButton(atom.UITransform);
+            if (!nativePanelOpened) nativePanelOpened = TryClickNativePluginsButton(atom.UITransformAlt);
+            if (!nativePanelOpened) nativePanelOpened = TryClickNativePluginsButton(pluginMgr.UITransform);
+            if (!nativePanelOpened) nativePanelOpened = TryClickNativePluginsButton(pluginMgr.UITransformAlt);
+
+            int openedScriptUis = 0;
+            for (int i = 0; i < plugin.scriptControllers.Count; i++) {
+                MVRScriptController controller = plugin.scriptControllers[i];
+                if (controller == null) continue;
+                try { controller.OpenUI(); openedScriptUis++; }
+                catch (Exception e) { DebugLog("Open script UI failed: " + e.Message); }
+            }
+            DebugLog("Opened target atom native UI. atom=" + atom.uid + ", slot=" + plugin.uid + ", nativePluginPanel=" + nativePanelOpened + ", scriptUIs=" + openedScriptUis);
+            pendingPluginPanelAtomUid = "";
+            pendingPluginPanelSlotUid = "";
+        } catch (Exception e) {
+            DebugLog("TryOpenTargetAtomPluginPanel FAILED: " + e.ToString());
+            RetryTargetAtomPluginPanel(e.Message);
         }
     }
 
@@ -4124,7 +5905,13 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
     }
 
     private string CatTextLabel(PackageLite p){ if(p==null||p.cats==null||p.cats.Count==0)return "其他"; List<string> labels=new List<string>(); for(int i=0;i<p.cats.Count;i++)labels.Add(CatLabel(p.cats[i])); return string.Join("，",labels.ToArray()); }
+    private void LeaveSceneSelection(){
+        if(selectedSceneAnalysis==null && selectedSceneItem==null)return;
+        StopScenePrewarm(true);
+        selectedSceneAnalysis=null;
+    }
     private void SelectPackage(PackageLite p){
+        LeaveSceneSelection();
         selected=p; selectedPreset=null; selectedVarPreset=null; selectedSceneItem=null; selectedWearableItem=null;
         LoadPreview(p);
         if(details!=null){
@@ -4148,7 +5935,21 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         SetStatus("已选择 "+p.uid, false);
     }
     private void LoadPreview(PackageLite p){ ClearPreview(); if(preview==null||p==null)return; try{ Texture2D tex; Sprite sp; if(!TryLoadPackageSprite(p,12L*1024L*1024L,out tex,out sp)) return; previewTex=tex; previewSprite=sp; preview.sprite=previewSprite; preview.color=Color.white;}catch(Exception e){Logger.LogWarning(e.Message);ClearPreview();}}
-    private bool TryLoadPackageSprite(PackageLite p,long maxBytes,out Texture2D tex,out Sprite sp){ tex=null; sp=null; try{ byte[] bytes=null; if(p!=null && p.thumbCache!="" && File.Exists(p.thumbCache)) bytes=File.ReadAllBytes(p.thumbCache); if(bytes==null && p!=null && p.thumbEntry!="") bytes=ReadBytes(p,p.thumbEntry,maxBytes); if(bytes==null||bytes.Length==0)return false; tex=new Texture2D(2,2,TextureFormat.RGBA32,false); if(!tex.LoadImage(bytes)){Destroy(tex);tex=null;return false;} sp=Sprite.Create(tex,new Rect(0,0,tex.width,tex.height),new Vector2(0.5f,0.5f)); return true;}catch(Exception e){Logger.LogWarning("TryLoadPackageSprite failed: "+e.Message); if(sp!=null)Destroy(sp); if(tex!=null)Destroy(tex); tex=null; sp=null; return false;}}
+    private bool TryLoadPackageSprite(PackageLite p,long maxBytes,out Texture2D tex,out Sprite sp){
+        tex=null; sp=null;
+        try{
+            byte[] bytes=null;
+            if(p!=null && p.thumbCache!="" && File.Exists(p.thumbCache)){
+                FileInfo cachedThumb=new FileInfo(p.thumbCache);
+                if(cachedThumb.Length>0 && cachedThumb.Length<=maxBytes)bytes=File.ReadAllBytes(p.thumbCache);
+            }
+            if(bytes==null && p!=null && p.thumbEntry!="")bytes=ReadBytes(p,p.thumbEntry,maxBytes);
+            if(bytes==null||bytes.Length==0)return false;
+            tex=new Texture2D(2,2,TextureFormat.RGBA32,false);
+            if(!tex.LoadImage(bytes)){Destroy(tex);tex=null;return false;}
+            sp=Sprite.Create(tex,new Rect(0,0,tex.width,tex.height),new Vector2(0.5f,0.5f)); return true;
+        }catch(Exception e){Logger.LogWarning("TryLoadPackageSprite failed: "+e.Message); if(sp!=null)Destroy(sp); if(tex!=null)Destroy(tex); tex=null; sp=null; return false;}
+    }
     private void StopThumbLoadCoroutine(){ if(thumbLoadCoroutine!=null){ try{ StopCoroutine(thumbLoadCoroutine); }catch{} thumbLoadCoroutine=null; } }
     private void ClearPreview(){ if(preview!=null){preview.sprite=null;preview.color=colThumbBg;} if(previewSprite!=null)Destroy(previewSprite); if(previewTex!=null)Destroy(previewTex); previewSprite=null;previewTex=null; }
     private void ClearListThumbs(){ for(int i=0;i<listThumbSprites.Count;i++) if(listThumbSprites[i]!=null)Destroy(listThumbSprites[i]); for(int i=0;i<listThumbTextures.Count;i++) if(listThumbTextures[i]!=null)Destroy(listThumbTextures[i]); listThumbSprites.Clear(); listThumbTextures.Clear(); }
@@ -4194,39 +5995,110 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
             if(Time.realtimeSinceStartup-lastLoadClickAt<0.75f){DebugLog("LoadPackageScene ignored duplicate click.");return;}
             lastLoadClickAt=Time.realtimeSinceStartup;
             if(p==null||scene==""){SetStatus("没有可加载的场景。",true);return;}
-            DebugLog("LoadPackageScene begin. uid="+p.uid+", scene="+scene);
+            CancelPendingSceneLoad();
+            string requestedSceneKey = SceneAnalysisKey(p, scene);
+            DebugLog("LoadPackageScene begin. uid="+p.uid+", scene="+scene+", mode="+SceneLoadModeName(sceneLoadMode)+", primary="+scenePrimaryPersonId);
             selected=p;
-            SelectPackage(p);
+            if (selectedSceneItem == null || selectedSceneItem.package != p || !string.Equals(selectedSceneItem.entryPath, scene, StringComparison.OrdinalIgnoreCase)) SelectPackage(p);
+            ClearPendingDeferredScene();
+            if (scenePrewarmCoroutine != null) {
+                try { StopCoroutine(scenePrewarmCoroutine); } catch {}
+                scenePrewarmCoroutine = null;
+            }
             int autoDeleted = 0;
             if(autoCleanLinksBeforeSceneLoad){
+                StopScenePrewarm(true);
                 autoDeleted = ClearGeneratedLinksForSceneLoad();
                 if(autoDeleted > 0) ScanAddonLightweight();
             }
             Stopwatch linkSw = Stopwatch.StartNew();
+            Stopwatch rootDepsSw = Stopwatch.StartNew();
             LinkResult result=LinkWithDeps(p);
+            rootDepsSw.Stop();
+            double sceneReadMs = 0, sceneRefsMs = 0, sceneVariantMs = 0, localizeMs = 0;
             string sceneJson = "";
             string sceneLoadPath = SceneRef(p, scene);
+            SceneVariantResult sceneVariant = null;
             int localizedScripts = 0;
+            bool localizedScriptsChanged = false;
+            TimelineOptimizationInfo timelineInfo = new TimelineOptimizationInfo();
             List<string> localizationErrors = new List<string>();
             try {
-                byte[] sceneData = ReadBytes(p, scene, 50L * 1024L * 1024L);
-                if (sceneData != null && sceneData.Length > 0) {
-                    DebugLog("LoadPackageScene scene-json read OK. bytes=" + sceneData.Length + ", scene=" + scene + ", uid=" + p.uid);
-                    sceneJson = Encoding.UTF8.GetString(sceneData);
+                Stopwatch stepSw = Stopwatch.StartNew();
+                if (selectedSceneAnalysis != null && string.Equals(selectedSceneAnalysis.key, requestedSceneKey, StringComparison.OrdinalIgnoreCase)
+                    && !string.IsNullOrEmpty(selectedSceneAnalysis.json)) {
+                    sceneJson = selectedSceneAnalysis.json;
+                    timelineInfo.cacheHit = true;
+                    timelineInfo.optimized = sceneJson.IndexOf("\"SerializeMode\":\"2\"", StringComparison.Ordinal) >= 0;
+                    timelineInfo.outputBytes = Encoding.UTF8.GetByteCount(sceneJson);
+                }
+                else {
+                    sceneJson = ReadSceneJsonWithTimelineOptimization(p, scene, out timelineInfo);
+                }
+                if (!string.IsNullOrEmpty(sceneJson)) {
+                    DebugLog("LoadPackageScene scene-json read OK. chars=" + sceneJson.Length + ", cached=" + (selectedSceneAnalysis != null && string.Equals(selectedSceneAnalysis.key, requestedSceneKey, StringComparison.OrdinalIgnoreCase)) + ", scene=" + scene + ", uid=" + p.uid);
+                    stepSw.Stop();
+                    sceneReadMs = stepSw.Elapsed.TotalMilliseconds;
+                    selectedSceneAnalysis = ReadAndAnalyzeScene(p, scene, sceneJson);
+                    if (selectedSceneAnalysis.personIds.Count > 0 && !selectedSceneAnalysis.personIds.Contains(scenePrimaryPersonId)) scenePrimaryPersonId = selectedSceneAnalysis.personIds[0];
+                    stepSw = Stopwatch.StartNew();
                     PresetLinkDiag sceneDiag = AutoLinkSceneDepsDetailed(sceneJson);
+                    stepSw.Stop();
+                    sceneRefsMs = stepSw.Elapsed.TotalMilliseconds;
                     result.created += sceneDiag.linked;
                     result.already += sceneDiag.already;
                     for (int i = 0; i < sceneDiag.missing.Count; i++) if (!result.missing.Contains(sceneDiag.missing[i])) result.missing.Add(sceneDiag.missing[i]);
                     for (int i = 0; i < sceneDiag.errors.Count; i++) result.errors.Add(sceneDiag.errors[i]);
+                    string preparedSceneJson = sceneJson;
+                    if (sceneLoadMode > 0) {
+                        stepSw = Stopwatch.StartNew();
+                        string variantError;
+                        SceneVariantResult builtVariant;
+                        if (TryBuildSceneVariants(selectedSceneAnalysis, sceneLoadMode, scenePrimaryPersonId, out builtVariant, out variantError)) {
+                            sceneVariant = builtVariant;
+                            preparedSceneJson = builtVariant.primaryJson;
+                            DebugLog("Scene variant built: mode=" + SceneLoadModeName(sceneLoadMode) + ", primary=" + scenePrimaryPersonId + ", total=" + builtVariant.totalAtoms + ", kept=" + builtVariant.keptAtoms + ", deferred=" + builtVariant.deferredAtoms + ", deferredTypes=" + string.Join(",", builtVariant.deferredTypes.ToArray()));
+                        } else {
+                            DebugLog("Scene variant fallback to full: " + variantError);
+                            SetStatus("人物优先分析失败，已回退完整加载：" + variantError, true);
+                        }
+                        stepSw.Stop();
+                        sceneVariantMs = stepSw.Elapsed.TotalMilliseconds;
+                    }
                     try {
-                        string localScene = MaterializeSceneWithLocalScripts(p, scene, sceneJson, out localizedScripts, out localizationErrors);
+                        stepSw = Stopwatch.StartNew();
+                        bool primaryScriptsChanged;
+                        string localScene = MaterializeSceneWithLocalScripts(p, scene, preparedSceneJson, out localizedScripts, out localizationErrors, out primaryScriptsChanged);
+                        localizedScriptsChanged |= primaryScriptsChanged;
+                        if (string.IsNullOrEmpty(localScene) && sceneVariant != null && sceneVariant.deferredAtoms > 0) localScene = WritePreparedSceneTemp(p, scene, preparedSceneJson, "primary");
+                        stepSw.Stop();
+                        localizeMs = stepSw.Elapsed.TotalMilliseconds;
                         if (!string.IsNullOrEmpty(localScene)) sceneLoadPath = localScene;
                         for (int le = 0; le < localizationErrors.Count; le++) DebugLog("Scene script localization issue: " + localizationErrors[le]);
+                        if (sceneVariant != null && sceneVariant.deferredAtoms > 0 && !string.IsNullOrEmpty(sceneVariant.deferredJson)) {
+                            int deferredLocalized;
+                            List<string> deferredErrors;
+                            bool deferredScriptsChanged;
+                            string deferredEntry = Path.GetFileNameWithoutExtension(scene) + "__deferred.json";
+                            string deferredPath = MaterializeSceneWithLocalScripts(p, deferredEntry, sceneVariant.deferredJson, out deferredLocalized, out deferredErrors, out deferredScriptsChanged);
+                            localizedScriptsChanged |= deferredScriptsChanged;
+                            localizedScripts += deferredLocalized;
+                            for (int de = 0; de < deferredErrors.Count; de++) localizationErrors.Add("deferred: " + deferredErrors[de]);
+                            if (string.IsNullOrEmpty(deferredPath)) deferredPath = WritePreparedSceneTemp(p, scene, sceneVariant.deferredJson, "deferred");
+                            pendingDeferredScenePath = deferredPath;
+                            pendingDeferredAtomCount = sceneVariant.deferredAtoms;
+                        }
                     } catch(Exception locEx) {
+                        sceneLoadPath = SceneRef(p, scene);
+                        sceneVariant = null;
+                        localizedScripts = 0;
+                        ClearPendingDeferredScene();
                         localizationErrors.Add(locEx.Message);
-                        DebugLog("Scene script localization failed: " + locEx.ToString());
+                        DebugLog("Scene script localization failed; falling back to the original full scene: " + locEx.ToString());
                     }
                 } else {
+                    stepSw.Stop();
+                    sceneReadMs = stepSw.Elapsed.TotalMilliseconds;
                     DebugLog("LoadPackageScene scene-json prelink skipped: unable to read " + scene + " from " + p.uid);
                 }
             } catch(Exception e) {
@@ -4234,7 +6106,7 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
             }
             linkSw.Stop();
             double refreshMs = 0;
-            if(result.created>0 || autoDeleted>0 || localizedScripts>0){
+            if(result.created>0 || autoDeleted>0 || localizedScriptsChanged){
                 Stopwatch refreshSw = Stopwatch.StartNew();
                 RefreshVam();
                 refreshSw.Stop();
@@ -4244,28 +6116,120 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
             }
             string sceneRef=SceneRef(p,scene);
             string msg="正在加载场景 "+sceneRef+" | 清理旧链接="+autoDeleted+"，新建链接="+result.created+"，已存在="+result.already+"，缺失依赖="+result.missing.Count+"，错误="+result.errors.Count+" | 准备="+totalSw.Elapsed.TotalSeconds.ToString("0.0")+"s";
+            if(sceneVariant!=null && sceneVariant.deferredAtoms>0) msg+=" | "+SceneLoadModeName(sceneLoadMode)+"="+sceneVariant.keptAtoms+"/"+sceneVariant.totalAtoms+"，其余="+sceneVariant.deferredAtoms;
             if(localizedScripts>0) msg+=" | 本地化脚本="+localizedScripts;
             if(localizationErrors.Count>0) msg+=" | 脚本本地化异常="+localizationErrors.Count;
             if(result.missing.Count>0) msg+=" | 缺失："+string.Join(", ",result.missing.ToArray());
             if(result.errors.Count>0) msg+=" | 错误："+string.Join("；",result.errors.ToArray());
             SetStatus(msg,true);
-            DebugLog("LoadPackageScene prep timings: autoDeleted="+autoDeleted+", linkMs="+linkSw.Elapsed.TotalMilliseconds.ToString("0")+", refreshMs="+refreshMs.ToString("0")+", totalMs="+totalSw.Elapsed.TotalMilliseconds.ToString("0")+", created="+result.created+", already="+result.already+", missing="+result.missing.Count+", errors="+result.errors.Count+", localizedScripts="+localizedScripts+", localizationErrors="+localizationErrors.Count+", sceneLoadPath="+sceneLoadPath);
+            DebugLog("LoadPackageScene prep timings: autoDeleted="+autoDeleted+", rootDepsMs="+rootDepsSw.Elapsed.TotalMilliseconds.ToString("0")+", sceneReadMs="+sceneReadMs.ToString("0")+", timelineCacheHit="+timelineInfo.cacheHit+", timelineOptimized="+timelineInfo.optimized+", timelineReadMs="+timelineInfo.readMs.ToString("0")+", timelineOptimizeMs="+timelineInfo.optimizeMs.ToString("0")+", timelineCacheReadMs="+timelineInfo.cacheReadMs.ToString("0")+", timelineSourceBytes="+timelineInfo.sourceBytes+", timelineOutputBytes="+timelineInfo.outputBytes+", timelineAnimations="+timelineInfo.animations+", timelineCurves="+timelineInfo.curves+", timelineKeys="+timelineInfo.keyframes+", sceneRefsMs="+sceneRefsMs.ToString("0")+", sceneVariantMs="+sceneVariantMs.ToString("0")+", localizeMs="+localizeMs.ToString("0")+", linkMs="+linkSw.Elapsed.TotalMilliseconds.ToString("0")+", refreshMs="+refreshMs.ToString("0")+", totalMs="+totalSw.Elapsed.TotalMilliseconds.ToString("0")+", created="+result.created+", already="+result.already+", missing="+result.missing.Count+", errors="+result.errors.Count+", localizedScripts="+localizedScripts+", localizedScriptsChanged="+localizedScriptsChanged+", localizationErrors="+localizationErrors.Count+", mode="+SceneLoadModeName(sceneLoadMode)+", primary="+scenePrimaryPersonId+", deferred="+pendingDeferredAtomCount+", sceneLoadPath="+sceneLoadPath);
             if(result.errors.Count==0 && SuperController.singleton!=null) ScheduleSceneLoad(sceneLoadPath);
-            else if(canvas!=null) RefreshList();
-        }catch(Exception e){ DebugLog("LoadPackageScene FAILED: "+e.ToString()); SetStatus("加载场景失败："+e.Message,true); }
+            else {
+                ClearPendingDeferredScene();
+                if (SuperController.singleton == null) SetStatus("加载场景失败：SuperController 为空 | " + sceneRef, true);
+                if(canvas!=null) UpdateInspectorVisibility();
+            }
+        }catch(Exception e){
+            CancelPendingSceneLoad();
+            ClearPendingDeferredScene();
+            StopScenePrewarm(true);
+            if(canvas!=null) UpdateInspectorVisibility();
+            DebugLog("LoadPackageScene FAILED: "+e.ToString());
+            SetStatus("加载场景失败："+e.Message,true);
+        }
+    }
+    private string WritePreparedSceneTemp(PackageLite p, string scene, string json, string tag) {
+        string dir = Path.Combine(vamRoot, "Saves\\scene\\_AllPackagesLinkerTempScenes");
+        Directory.CreateDirectory(dir);
+        string baseName = SafeFileName((p == null ? "scene" : p.uid) + "__" + Path.GetFileNameWithoutExtension(scene) + "__" + tag + ".json");
+        if (!baseName.EndsWith(".json", StringComparison.OrdinalIgnoreCase)) baseName += ".json";
+        string outPath = Path.Combine(dir, baseName);
+        File.WriteAllText(outPath, json, Encoding.UTF8);
+        DebugLog("Prepared scene temp written: tag=" + tag + ", chars=" + json.Length + ", out=" + outPath);
+        return Norm(MakeRel(vamRoot, outPath));
     }
     private string SceneRef(PackageLite p,string scene){ return p.uid+":/"+Norm(scene); }
-    private void ScheduleSceneLoad(string scenePath){
-        pendingScenePath=scenePath;
-        DebugLog("Scene load scheduled: "+scenePath+" | refresh=0.4,1.2 load=2.2");
+    private void CancelPendingSceneLoad(){
         CancelInvoke("DoDelayedSceneLoad");
-        CancelInvoke("RefreshVamBeforeDelayedSceneLoad");
-        Invoke("RefreshVamBeforeDelayedSceneLoad",0.4f);
-        Invoke("RefreshVamBeforeDelayedSceneLoad",1.2f);
-        Invoke("DoDelayedSceneLoad",2.2f);
+        CancelInvoke("TryDispatchSceneLoadAfterPrewarm");
+        pendingScenePath="";
     }
-    private void RefreshVamBeforeDelayedSceneLoad(){ try{ DebugLog("RefreshVamBeforeDelayedSceneLoad begin. pendingScenePath=" + pendingScenePath); RefreshVam(); DebugLog("RefreshVamBeforeDelayedSceneLoad end. addonExact=" + addonExact.Count + ", addonLatest=" + addonLatest.Count); }catch(Exception e){ DebugLog("RefreshVamBeforeDelayedSceneLoad failed: " + e.Message); } }
-    private void DoDelayedSceneLoad(){ string scenePath=pendingScenePath; try{ DebugLog("Calling SuperController.Load: "+scenePath+", superController="+(SuperController.singleton!=null)); if(SuperController.singleton!=null) { SuperController.singleton.Load(scenePath); CancelInvoke("PatchLoadedPackageScriptPluginUrls"); Invoke("PatchLoadedPackageScriptPluginUrls", 3.0f); Invoke("PatchLoadedPackageScriptPluginUrls", 6.0f); Invoke("PatchLoadedPackageScriptPluginUrls", 10.0f); if(autoAllowAllPlugins){ CancelInvoke("AutoAllowAllPendingPluginPackages"); Invoke("AutoAllowAllPendingPluginPackages", 1.0f); Invoke("AutoAllowAllPendingPluginPackages", 2.5f); Invoke("AutoAllowAllPendingPluginPackages", 5.0f); } } else SetStatus("加载场景失败：SuperController 为空 | "+scenePath,true); }catch(Exception e){ DebugLog("DoDelayedSceneLoad FAILED: "+e.ToString()); SetStatus("加载场景失败："+e.Message+" | "+scenePath,true); } }
+    private void ClearPendingDeferredScene(){ pendingDeferredScenePath=""; pendingDeferredAtomCount=0; }
+    private void ScheduleSceneLoad(string scenePath){
+        CancelPendingSceneLoad();
+        pendingScenePath=scenePath;
+        DebugLog("Scene load scheduled: "+scenePath+" | loadDelay="+SceneLoadDispatchDelay.ToString("0.00")+"s; package refresh already completed synchronously when needed.");
+        CancelInvoke("DoDelayedSceneLoad");
+        CancelInvoke("TryDispatchSceneLoadAfterPrewarm");
+        if(scenePrewarmPending>0 && !string.IsNullOrEmpty(scenePrewarmKey)){
+            scenePrewarmWaitUntil=Time.realtimeSinceStartup+8.0f;
+            DebugLog("Scene load waiting for active skin prewarm. pending="+scenePrewarmPending+", timeout=8.0s");
+            Invoke("TryDispatchSceneLoadAfterPrewarm",SceneLoadDispatchDelay);
+        } else Invoke("DoDelayedSceneLoad",SceneLoadDispatchDelay);
+    }
+    private void TryDispatchSceneLoadAfterPrewarm(){
+        if(scenePrewarmPending>0 && Time.realtimeSinceStartup<scenePrewarmWaitUntil){ Invoke("TryDispatchSceneLoadAfterPrewarm",0.10f); return; }
+        bool timedOut=scenePrewarmPending>0;
+        DebugLog("Scene prewarm wait ended. pending="+scenePrewarmPending+", timedOut="+timedOut);
+        if(timedOut) StopScenePrewarm(true);
+        DoDelayedSceneLoad();
+    }
+    private void DoDelayedSceneLoad() {
+        string scenePath = pendingScenePath;
+        pendingScenePath = "";
+        Stopwatch loadSw = Stopwatch.StartNew();
+        try {
+            DebugLog("Calling SuperController.Load: " + scenePath + ", superController=" + (SuperController.singleton != null));
+            if (string.IsNullOrEmpty(scenePath)) throw new InvalidOperationException("待加载场景路径为空");
+            if (SuperController.singleton != null) {
+                SuperController.singleton.Load(scenePath);
+                loadSw.Stop();
+                DebugLog("SuperController.Load returned: path=" + scenePath + ", elapsedMs=" + loadSw.Elapsed.TotalMilliseconds.ToString("0"));
+                CancelInvoke("PatchLoadedPackageScriptPluginUrls");
+                Invoke("PatchLoadedPackageScriptPluginUrls", 3.0f);
+                Invoke("PatchLoadedPackageScriptPluginUrls", 6.0f);
+                Invoke("PatchLoadedPackageScriptPluginUrls", 10.0f);
+                if (autoAllowAllPlugins) {
+                    CancelInvoke("AutoAllowAllPendingPluginPackages");
+                    Invoke("AutoAllowAllPendingPluginPackages", 1.0f);
+                    Invoke("AutoAllowAllPendingPluginPackages", 2.5f);
+                    Invoke("AutoAllowAllPendingPluginPackages", 5.0f);
+                }
+            } else {
+                ClearPendingDeferredScene();
+                if (canvas != null) UpdateInspectorVisibility();
+                SetStatus("加载场景失败：SuperController 为空 | " + scenePath, true);
+            }
+        } catch(Exception e) {
+            loadSw.Stop();
+            ClearPendingDeferredScene();
+            if (canvas != null) UpdateInspectorVisibility();
+            DebugLog("DoDelayedSceneLoad FAILED after " + loadSw.Elapsed.TotalMilliseconds.ToString("0") + "ms: " + e.ToString());
+            SetStatus("加载场景失败：" + e.Message + " | " + scenePath, true);
+        }
+    }
+    private void LoadDeferredSceneAtoms(){
+        string path=pendingDeferredScenePath;
+        int count=pendingDeferredAtomCount;
+        if(string.IsNullOrEmpty(path)||count<=0){SetStatus("没有等待加载的其余 Atom。",false);return;}
+        try{
+            if(SuperController.singleton==null){SetStatus("加载其余 Atom 失败：SuperController 为空。",true);return;}
+            DebugLog("Calling SuperController.LoadMerge: "+path+", atoms="+count);
+            pendingDeferredScenePath=""; pendingDeferredAtomCount=0;
+            UpdateInspectorVisibility();
+            SuperController.singleton.LoadMerge(path);
+            SetStatus("正在合并加载其余 "+count+" 个 Atom...",true);
+            CancelInvoke("PatchLoadedPackageScriptPluginUrls");
+            Invoke("PatchLoadedPackageScriptPluginUrls",3.0f);
+            Invoke("PatchLoadedPackageScriptPluginUrls",6.0f);
+            Invoke("PatchLoadedPackageScriptPluginUrls",10.0f);
+        }catch(Exception e){
+            pendingDeferredScenePath=path; pendingDeferredAtomCount=count;
+            DebugLog("LoadDeferredSceneAtoms FAILED: "+e.ToString());
+            SetStatus("加载其余 Atom 失败："+e.Message,true);
+            UpdateInspectorVisibility();
+        }
+    }
     private LinkResult LinkWithDeps(PackageLite rootp){ LinkResult result=new LinkResult(); var todo=new List<PackageLite>(); var seen=new HashSet<string>(StringComparer.OrdinalIgnoreCase); var exactAliases=new Dictionary<string,PackageLite>(StringComparer.OrdinalIgnoreCase); Collect(rootp,todo,seen,result.missing,exactAliases); Directory.CreateDirectory(linkRoot); foreach(var p in todo){ bool exactRoot = rootp!=null && string.Equals(p.uid,rootp.uid,StringComparison.OrdinalIgnoreCase); if(exactRoot ? IsExactAvailableInAddon(p.uid) : IsAvailableInAddon(p.uid)){result.already++;continue;} try{ if(LinkOne(p))result.created++; }catch(Exception e){result.errors.Add(p.uid+":"+e.Message);} } foreach(KeyValuePair<string,PackageLite> alias in exactAliases){try{if(IsExactAvailableInAddon(alias.Key)){result.already++;continue;}if(LinkExactAlias(alias.Key,alias.Value))result.created++;}catch(Exception e){result.errors.Add(alias.Key+"=>"+(alias.Value==null?"null":alias.Value.uid)+":"+e.Message);}} return result; }
     private void Collect(PackageLite p,List<PackageLite> todo,HashSet<string> seen,List<string> miss,Dictionary<string,PackageLite> exactAliases){ if(p==null||!seen.Add(p.uid))return; todo.Add(p); foreach(string d in p.deps){ PackageLite r; bool already; string source; if(!TryResolveDepDetailed(d,out r,out already,out source)){if(!miss.Contains(d))miss.Add(d);continue;} if(!d.EndsWith(".latest",StringComparison.OrdinalIgnoreCase) && r!=null && !string.Equals(d,r.uid,StringComparison.OrdinalIgnoreCase) && source.IndexOf("compatible-newer-version",StringComparison.OrdinalIgnoreCase)>=0) exactAliases[d]=r; if(!already)Collect(r,todo,seen,miss,exactAliases);} }
     private bool ResolveDep(string d,out PackageLite p,out bool already){ string source; return TryResolveDepDetailed(d,out p,out already,out source); }
@@ -4305,8 +6269,75 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
     private bool FindValidLatestInAll(string latestKey,out PackageLite p){ p=null; int best=-1; for(int i=0;i<all.Count;i++){ PackageLite x=all[i]; if(x==null)continue; string k=Group(x.uid)+".latest"; if(!string.Equals(k,latestKey,StringComparison.OrdinalIgnoreCase))continue; if(!CanOpenVarFile(x.fullPath))continue; int v=Version(x.uid); if(p==null || v>best){ p=x; best=v; } } if(p!=null){ allLatest[latestKey]=p; return true; } return false; }
     private bool IsExactAvailableInAddon(string uid){ PackageLite p; return addonExact.TryGetValue(uid,out p) && CanOpenVarFile(p.fullPath); }
     private bool IsAvailableOutsideLinkRoot(string uid){ PackageLite p; if(!addonExact.TryGetValue(uid,out p) || !CanOpenVarFile(p.fullPath))return false; return !Path.GetFullPath(p.fullPath).StartsWith(Path.GetFullPath(linkRoot),StringComparison.OrdinalIgnoreCase); }
-    private bool LinkExactAlias(string requestedUid,PackageLite source){ if(string.IsNullOrEmpty(requestedUid)||source==null||!CanOpenVarFile(source.fullPath))throw new Exception("精确版本别名源包不可用"); string dir=Path.Combine(linkRoot,"_ExactVersionAliases"); Directory.CreateDirectory(dir); string link=Path.Combine(dir,SafeFileName(requestedUid)+".var"); DeletePathIfExistsOrReparse(link); string apiOut; if(TryCreateFileSymlink(link,source.fullPath,out apiOut)){DebugLog("LinkExactAlias API symlink OK: "+requestedUid+" -> "+source.uid+" | "+link);return true;} string hardlinkOut; if(RunCmd("mklink /H "+Q(link)+" "+Q(source.fullPath),out hardlinkOut)){DebugLog("LinkExactAlias hardlink OK: "+requestedUid+" -> "+source.uid+" | "+link);return true;} try{File.Copy(source.fullPath,link,true);DebugLog("LinkExactAlias fallback COPY: "+requestedUid+" -> "+source.uid+" | "+link);return true;}catch(Exception e){throw new Exception("api="+apiOut+" | hardlink="+hardlinkOut+" | copy="+e.Message);} }
-    private bool LinkOne(PackageLite p){ if(p==null || !CanOpenVarFile(p.fullPath)) throw new Exception("源包不存在或不可读: "+(p==null?"null":p.fullPath)); string link=Path.Combine(linkRoot,p.relPath); Directory.CreateDirectory(Path.GetDirectoryName(link)); DeletePathIfExistsOrReparse(link); string apiOut; if(TryCreateFileSymlink(link,p.fullPath,out apiOut)){DebugLog("LinkOne API symlink OK: "+link+" -> "+p.fullPath);return true;} string symlinkOut; if(RunCmd("mklink "+Q(link)+" "+Q(p.fullPath),out symlinkOut)){DebugLog("LinkOne mklink OK: "+link+" -> "+p.fullPath);return true;} string hardlinkOut; if(RunCmd("mklink /H "+Q(link)+" "+Q(p.fullPath),out hardlinkOut)){DebugLog("LinkOne hardlink OK: "+link+" -> "+p.fullPath);return true;} try{ DeletePathIfExistsOrReparse(link); DebugLog("LinkOne fallback COPY. api="+apiOut+", symlinkOut="+symlinkOut+", hardlinkOut="+hardlinkOut); File.Copy(p.fullPath,link,true); try{File.SetLastWriteTimeUtc(link,new DateTime(p.mtimeUtcTicks,DateTimeKind.Utc));}catch{} return true; }catch(Exception copyEx){ throw new Exception("api symlink failed: "+apiOut+" | mklink failed: "+symlinkOut+" | hardlink failed: "+hardlinkOut+" | copy failed: "+copyEx.Message); } }
+    private bool LinkExactAlias(string requestedUid,PackageLite source){
+        if(string.IsNullOrEmpty(requestedUid)||source==null||!CanOpenVarFile(source.fullPath))throw new Exception("精确版本别名源包不可用");
+        string dir=Path.Combine(linkRoot,"_ExactVersionAliases");
+        Directory.CreateDirectory(dir);
+        string link=Path.Combine(dir,SafeFileName(requestedUid)+".var");
+        DeletePathIfExistsOrReparse(link);
+        string apiOut;
+        if(TryCreateFileSymlink(link,source.fullPath,out apiOut)){
+            RegisterCreatedAddonLink(requestedUid,source,link);
+            DebugLog("LinkExactAlias API symlink OK: "+requestedUid+" -> "+source.uid+" | "+link);
+            return true;
+        }
+        string hardlinkOut;
+        if(RunCmd("mklink /H "+Q(link)+" "+Q(source.fullPath),out hardlinkOut)){
+            RegisterCreatedAddonLink(requestedUid,source,link);
+            DebugLog("LinkExactAlias hardlink OK: "+requestedUid+" -> "+source.uid+" | "+link);
+            return true;
+        }
+        try{
+            File.Copy(source.fullPath,link,true);
+            RegisterCreatedAddonLink(requestedUid,source,link);
+            DebugLog("LinkExactAlias fallback COPY: "+requestedUid+" -> "+source.uid+" | "+link);
+            return true;
+        }catch(Exception e){throw new Exception("api="+apiOut+" | hardlink="+hardlinkOut+" | copy="+e.Message);}
+    }
+    private bool LinkOne(PackageLite p){
+        if(p==null || !CanOpenVarFile(p.fullPath)) throw new Exception("源包不存在或不可读: "+(p==null?"null":p.fullPath));
+        string link=Path.Combine(linkRoot,p.relPath);
+        Directory.CreateDirectory(Path.GetDirectoryName(link));
+        DeletePathIfExistsOrReparse(link);
+        string apiOut;
+        if(TryCreateFileSymlink(link,p.fullPath,out apiOut)){
+            RegisterCreatedAddonLink(p.uid,p,link);
+            DebugLog("LinkOne API symlink OK: "+link+" -> "+p.fullPath);
+            return true;
+        }
+        string symlinkOut;
+        if(RunCmd("mklink "+Q(link)+" "+Q(p.fullPath),out symlinkOut)){
+            RegisterCreatedAddonLink(p.uid,p,link);
+            DebugLog("LinkOne mklink OK: "+link+" -> "+p.fullPath);
+            return true;
+        }
+        string hardlinkOut;
+        if(RunCmd("mklink /H "+Q(link)+" "+Q(p.fullPath),out hardlinkOut)){
+            RegisterCreatedAddonLink(p.uid,p,link);
+            DebugLog("LinkOne hardlink OK: "+link+" -> "+p.fullPath);
+            return true;
+        }
+        try{
+            DeletePathIfExistsOrReparse(link);
+            DebugLog("LinkOne fallback COPY. api="+apiOut+", symlinkOut="+symlinkOut+", hardlinkOut="+hardlinkOut);
+            File.Copy(p.fullPath,link,true);
+            try{File.SetLastWriteTimeUtc(link,new DateTime(p.mtimeUtcTicks,DateTimeKind.Utc));}catch{}
+            RegisterCreatedAddonLink(p.uid,p,link);
+            return true;
+        }catch(Exception copyEx){ throw new Exception("api symlink failed: "+apiOut+" | mklink failed: "+symlinkOut+" | hardlink failed: "+hardlinkOut+" | copy failed: "+copyEx.Message); }
+    }
+    private void RegisterCreatedAddonLink(string advertisedUid,PackageLite source,string link){
+        PackageLite linked=new PackageLite();
+        linked.uid=advertisedUid;
+        linked.fullPath=Path.GetFullPath(link);
+        linked.relPath=MakeRel(addonRoot,linked.fullPath);
+        linked.size=source==null?0:source.size;
+        linked.mtimeUtcTicks=source==null?0:source.mtimeUtcTicks;
+        addonExact[advertisedUid]=linked;
+        string latestKey=Group(advertisedUid)+".latest";
+        PackageLite old;
+        if(!addonLatest.TryGetValue(latestKey,out old)||Version(advertisedUid)>Version(old.uid)) addonLatest[latestKey]=linked;
+    }
     private bool TryCreateFileSymlink(string link,string target,out string output){ output=""; try{ bool ok=CreateSymbolicLink(link,target,SYMBOLIC_LINK_FLAG_FILE|SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE); int err=Marshal.GetLastWin32Error(); output=ok?"ok":"win32="+err; return ok; }catch(Exception e){ output=e.Message; return false; } }
     private bool RunCmd(string cmd,out string output){ output=""; var psi=new ProcessStartInfo("cmd.exe","/c "+cmd); psi.CreateNoWindow=true; psi.UseShellExecute=false; psi.RedirectStandardOutput=true; psi.RedirectStandardError=true; using(Process pr=Process.Start(psi)){ if(!pr.WaitForExit(15000)){try{pr.Kill();}catch{} output="timeout"; return false;} output=(pr.StandardOutput.ReadToEnd()+" "+pr.StandardError.ReadToEnd()).Trim(); return pr.ExitCode==0; } }
     private string Q(string s){return "\""+s.Replace("\"","\"\"")+"\"";}
@@ -4321,7 +6352,19 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
     private void ClearLinks(){ try{ if(!Directory.Exists(linkRoot)){SetStatus("没有可清理的插件生成链接。",true);return;} int deleted=0,skipped=0,errors=0; string basePath=Path.GetFullPath(linkRoot).TrimEnd(Path.DirectorySeparatorChar,Path.AltDirectorySeparatorChar)+Path.DirectorySeparatorChar; string[] files=Directory.GetFiles(linkRoot,"*.var",SearchOption.AllDirectories); foreach(string f in files){ string full=Path.GetFullPath(f); if(!full.StartsWith(basePath,StringComparison.OrdinalIgnoreCase))continue; string uid=Path.GetFileNameWithoutExtension(f); if(defaultUids.Contains(uid)){skipped++;continue;} try{File.Delete(full);deleted++;}catch(Exception e){errors++;DebugLog("Delete generated link failed "+full+": "+e.Message);} } RemoveEmptyDirs(linkRoot); SetStatus("已清除插件生成软链接：删除="+deleted+"，默认保留跳过="+skipped+"，失败="+errors,true); RefreshVam(); }catch(Exception e){SetStatus("清除失败："+e.Message,true);} }
     private int ClearGeneratedLinksForSceneLoad(){ int deleted=0,skipped=0,errors=0; try{ if(!Directory.Exists(linkRoot))return 0; string basePath=Path.GetFullPath(linkRoot).TrimEnd(Path.DirectorySeparatorChar,Path.AltDirectorySeparatorChar)+Path.DirectorySeparatorChar; string[] files=Directory.GetFiles(linkRoot,"*.var",SearchOption.AllDirectories); foreach(string f in files){ string full=Path.GetFullPath(f); if(!full.StartsWith(basePath,StringComparison.OrdinalIgnoreCase))continue; string uid=Path.GetFileNameWithoutExtension(f); if(defaultUids.Contains(uid)){skipped++;continue;} try{File.Delete(full);deleted++;}catch(Exception e){errors++;DebugLog("Auto clean generated link failed "+full+": "+e.Message);} } if(deleted>0)RemoveEmptyDirs(linkRoot); if(deleted>0||skipped>0||errors>0)DebugLog("Auto clean before scene load: deleted="+deleted+", defaultSkipped="+skipped+", errors="+errors); }catch(Exception e){ DebugLog("Auto clean before scene load failed: "+e.Message); } return deleted; }
     private void RemoveEmptyDirs(string rootDir){ try{ string[] dirs=Directory.GetDirectories(rootDir,"*",SearchOption.AllDirectories); Array.Sort(dirs); for(int i=dirs.Length-1;i>=0;i--){ try{ if(Directory.GetFiles(dirs[i]).Length==0 && Directory.GetDirectories(dirs[i]).Length==0) Directory.Delete(dirs[i]); }catch{} } }catch{} }
-    private void RefreshVam(){ try{ CleanBrokenGeneratedLinks(); }catch{} try{ FileManager.Refresh(); }catch{} try{ if(SuperController.singleton!=null)SuperController.singleton.RescanPackages(); }catch{} ScanAddonLightweight(); }
+    private void RefreshVam(){
+        Stopwatch sw=Stopwatch.StartNew();
+        int cleaned=0;
+        try{cleaned=CleanBrokenGeneratedLinks();}catch(Exception e){DebugLog("RefreshVam broken-link cleanup failed: "+e.Message);}
+        try{
+            // VaM 1.22 SuperController.RescanPackages() is only a wrapper around
+            // FileManager.Refresh(), so calling both performs the same package scan twice.
+            FileManager.Refresh();
+        }catch(Exception e){DebugLog("RefreshVam FileManager.Refresh failed: "+e.Message);}
+        ScanAddonLightweight();
+        sw.Stop();
+        DebugLog("RefreshVam completed. ms="+sw.Elapsed.TotalMilliseconds.ToString("0")+", cleaned="+cleaned+", addon="+addonExact.Count);
+    }
 
     private void DeleteSelectedPackage() {
         if (selected == null) { SetStatus("未选择包。", false); return; }
@@ -4405,10 +6448,18 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         Toggle autoOpenLoadTg = MakeToggle(content.transform, "插件加载后自动打开本界面", autoOpenPanelOnPluginLoad);
         SetFixedHeight(autoOpenLoadTg.gameObject, isVRMode ? 48f : 42f);
         autoOpenLoadTg.onValueChanged.AddListener((bool v) => { autoOpenPanelOnPluginLoad = v; SaveConfig(); SetStatus("插件加载后自动打开界面：" + (v ? "开" : "关"), true); });
-        Text autoOpenHint = MakeText(content.transform, "AutoOpenHint", "开启后：BepInEx 加载本插件约 2 秒会自动弹出窗口（桌面）。", 12, TextAnchor.UpperLeft, colTextSecondary);
+        Text autoOpenHint = MakeText(content.transform, "AutoOpenHint", "开启后：BepInEx 加载本插件约 2 秒自动弹出。VR 下会开世界空间面板（头显可见），桌面为 Overlay。", 12, TextAnchor.UpperLeft, colTextSecondary);
         autoOpenHint.horizontalOverflow = HorizontalWrapMode.Wrap;
         autoOpenHint.verticalOverflow = VerticalWrapMode.Overflow;
-        SetFixedHeight(autoOpenHint.gameObject, 36f);
+        SetFixedHeight(autoOpenHint.gameObject, 48f);
+
+        Toggle autoOpenTargetPluginTg = MakeToggle(content.transform, "脚本加载到原子后自动打开该原子的插件面板", autoOpenTargetAtomPluginPanel);
+        SetFixedHeight(autoOpenTargetPluginTg.gameObject, isVRMode ? 48f : 42f);
+        autoOpenTargetPluginTg.onValueChanged.AddListener((bool v) => { autoOpenTargetAtomPluginPanel = v; SaveConfig(); SetStatus("脚本加载后打开目标原子插件面板：" + (v ? "开" : "关"), true); });
+        Text autoOpenTargetHint = MakeText(content.transform, "AutoOpenTargetHint", "此项与“插件加载后自动打开本界面”不同：它会在脚本完成加载后选中目标原子，打开 VaM 原生编辑界面和 Plugins 面板，并显示脚本 UI。", 12, TextAnchor.UpperLeft, colTextSecondary);
+        autoOpenTargetHint.horizontalOverflow = HorizontalWrapMode.Wrap;
+        autoOpenTargetHint.verticalOverflow = VerticalWrapMode.Overflow;
+        SetFixedHeight(autoOpenTargetHint.gameObject, 52f);
 
         Toggle autoOpenTg = MakeToggle(content.transform, "仅编辑模式自动打开（兼容旧选项）", autoOpenPanelInEditMode);
         SetFixedHeight(autoOpenTg.gameObject, isVRMode ? 44f : 40f);
@@ -4432,6 +6483,53 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         Toggle autoCleanLinksTg = MakeToggle(content.transform, "加载场景前清理旧链接", autoCleanLinksBeforeSceneLoad);
         SetFixedHeight(autoCleanLinksTg.gameObject, 34f);
         autoCleanLinksTg.onValueChanged.AddListener((bool v) => { autoCleanLinksBeforeSceneLoad = v; SaveConfig(); SetStatus("加载场景前清理旧链接：" + (v ? "开" : "关"), true); });
+        Toggle scenePrewarmTg = MakeToggle(content.transform, "选中场景后预热主人物皮肤", sceneTexturePrewarmEnabled);
+        SetFixedHeight(scenePrewarmTg.gameObject, isVRMode ? 44f : 38f);
+        scenePrewarmTg.onValueChanged.AddListener((bool v) => {
+            sceneTexturePrewarmEnabled = v;
+            SaveConfig();
+            if (v) StartSelectedScenePrewarm(); else StopScenePrewarm(true);
+            SetStatus("场景皮肤预热：" + (v ? "开" : "关"), true);
+        });
+
+        // VR 镜头模式：桌面/VR 设置都可配，不依赖当前面板模式
+        Text gVrRot = MakeText(content.transform, "GVrRot", "VR 镜头模式", 15, TextAnchor.MiddleLeft, colAccent);
+        SetFixedHeight(gVrRot.gameObject, 24f);
+        Toggle vrRotTg = MakeToggle(content.transform, "启用镜头模式（左摇杆按下切换）", vrRotationEnabled);
+        SetFixedHeight(vrRotTg.gameObject, isVRMode ? 48f : 42f);
+        vrRotTg.onValueChanged.AddListener((bool v) => {
+            vrRotationEnabled = v;
+            if (!v) ExitVrRotationMode("settings-off");
+            SaveConfig();
+            SetStatus("镜头模式：" + (v ? "开" : "关"), true);
+        });
+        Text vrRotHint = MakeText(content.transform, "VrRotHint", "左移动摇杆按一下进入/退出。开启后：左右推杆=水平转向，前后推杆=升高/降低视角。", 12, TextAnchor.UpperLeft, colTextSecondary);
+        vrRotHint.horizontalOverflow = HorizontalWrapMode.Wrap;
+        vrRotHint.verticalOverflow = VerticalWrapMode.Overflow;
+        SetFixedHeight(vrRotHint.gameObject, 48f);
+        Toggle vrInvTg = MakeToggle(content.transform, "反转左右转向", vrRotationInvert);
+        SetFixedHeight(vrInvTg.gameObject, isVRMode ? 44f : 38f);
+        vrInvTg.onValueChanged.AddListener((bool v) => { vrRotationInvert = v; SaveConfig(); SetStatus("左右转向反转：" + (v ? "开" : "关"), true); });
+        Toggle vrHInvTg = MakeToggle(content.transform, "反转升降方向", vrHeightInvert);
+        SetFixedHeight(vrHInvTg.gameObject, isVRMode ? 44f : 38f);
+        vrHInvTg.onValueChanged.AddListener((bool v) => { vrHeightInvert = v; SaveConfig(); SetStatus("升降反转：" + (v ? "开" : "关"), true); });
+        GameObject sensRow = CreateRow(content.transform, "VrSens", isVRMode ? 42f : 36f, 6, true);
+        Button sensMinus = MakeButton(sensRow.transform, "转向慢", 13, colBtn); SetFlexibleItem(sensMinus.gameObject, 0f, 1f);
+        sensMinus.onClick.AddListener(() => { vrRotationSensitivity = Mathf.Clamp(vrRotationSensitivity - 10f, 10f, 180f); SaveConfig(); SetStatus("转向灵敏度=" + vrRotationSensitivity.ToString("0") + "°/s", false); });
+        Button sensPlus = MakeButton(sensRow.transform, "转向快", 13, colBtn); SetFlexibleItem(sensPlus.gameObject, 0f, 1f);
+        sensPlus.onClick.AddListener(() => { vrRotationSensitivity = Mathf.Clamp(vrRotationSensitivity + 10f, 10f, 180f); SaveConfig(); SetStatus("转向灵敏度=" + vrRotationSensitivity.ToString("0") + "°/s", false); });
+        GameObject hRow = CreateRow(content.transform, "VrHeight", isVRMode ? 42f : 36f, 6, true);
+        Button hMinus = MakeButton(hRow.transform, "升降慢", 13, colBtn); SetFlexibleItem(hMinus.gameObject, 0f, 1f);
+        hMinus.onClick.AddListener(() => { vrHeightSpeed = Mathf.Clamp(vrHeightSpeed - 0.15f, 0.10f, 3.00f); SaveConfig(); SetStatus("升降速度=" + vrHeightSpeed.ToString("0.00") + " m/s", false); });
+        Button hPlus = MakeButton(hRow.transform, "升降快", 13, colBtn); SetFlexibleItem(hPlus.gameObject, 0f, 1f);
+        hPlus.onClick.AddListener(() => { vrHeightSpeed = Mathf.Clamp(vrHeightSpeed + 0.15f, 0.10f, 3.00f); SaveConfig(); SetStatus("升降速度=" + vrHeightSpeed.ToString("0.00") + " m/s", false); });
+        GameObject snapRow = CreateRow(content.transform, "VrSnap", isVRMode ? 42f : 36f, 6, true);
+        Button snapCont = MakeButton(snapRow.transform, "连续转向", 12, colBtn); SetFlexibleItem(snapCont.gameObject, 0f, 1f);
+        snapCont.onClick.AddListener(() => { vrRotationSnapAngle = 0f; SaveConfig(); SetStatus("镜头转向：连续", false); });
+        Button snap30 = MakeButton(snapRow.transform, "舒适30°", 12, colBtn); SetFlexibleItem(snap30.gameObject, 0f, 1f);
+        snap30.onClick.AddListener(() => { vrRotationSnapAngle = 30f; SaveConfig(); SetStatus("镜头转向：舒适 30°", false); });
+        Button snap45 = MakeButton(snapRow.transform, "舒适45°", 12, colBtn); SetFlexibleItem(snap45.gameObject, 0f, 1f);
+        snap45.onClick.AddListener(() => { vrRotationSnapAngle = 45f; SaveConfig(); SetStatus("镜头转向：舒适 45°", false); });
 
         if (isVRMode) {
             Text g3 = MakeText(content.transform, "G3", "VR 界面", 15, TextAnchor.MiddleLeft, colAccent);
@@ -4502,6 +6600,7 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
     }
 
     private void ClearSelectionKeepPreview(bool clearPreview) {
+        LeaveSceneSelection();
         selected = null; selectedPreset = null; selectedVarPreset = null; selectedSceneItem = null; selectedWearableItem = null;
         if (clearPreview) ClearPreview();
         if (details != null) {
@@ -4567,7 +6666,11 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         SetGoActive(atomRowRoot, isPreset || isScript || isWearable);
         SetGoActive(presetOptionsRoot, isPreset);
         SetGoActive(presetModeRoot, false); // 快捷模式已移除
-        SetGoActive(sceneActionRoot, isScene || (selected != null && selected.firstScene != "" && activeCat == "Scenes" && selectedSceneItem == null));
+        SetGoActive(sceneModeRoot, isScene);
+        SetGoActive(scenePersonRoot, isScene && selectedSceneAnalysis != null && selectedSceneAnalysis.personIds.Count > 0);
+        bool canLoadScene = isScene || (selected != null && selected.firstScene != "" && activeCat == "Scenes" && selectedSceneItem == null);
+        bool hasDeferredScene = !string.IsNullOrEmpty(pendingDeferredScenePath) && pendingDeferredAtomCount > 0;
+        SetGoActive(sceneActionRoot, canLoadScene || hasDeferredScene);
         SetGoActive(presetActionRoot, isPreset);
         SetGoActive(moreActionsRoot, isScript);
         SetGoActive(linkActionRoot, hasAny);
@@ -4578,8 +6681,11 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         if (loadSceneBtn != null) {
             var img = loadSceneBtn.GetComponent<Image>();
             if (img != null) img.color = hasAny && isScene ? colAccent : colBtn;
-            loadSceneBtn.interactable = isScene || (selected != null && selected.firstScene != "");
+            loadSceneBtn.interactable = canLoadScene;
+            loadSceneBtn.gameObject.SetActive(canLoadScene);
         }
+        if (loadDeferredSceneBtn != null) loadDeferredSceneBtn.gameObject.SetActive(hasDeferredScene);
+        UpdateSceneLoadModeUI();
         if (applyPresetBtn != null) applyPresetBtn.interactable = isPreset;
         if (loadScriptBtn != null) loadScriptBtn.interactable = isScript;
         if (linkOnlyBtn != null) linkOnlyBtn.interactable = selected != null;
