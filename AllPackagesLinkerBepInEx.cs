@@ -17,9 +17,9 @@ using ICSharpCode.SharpZipLib.Zip;
 using MVR.FileManagement;
 using Valve.VR;
 
-[BepInPlugin("local.vam.allpackageslinker", "AllPackagesLinker", "1.3.5")]
+[BepInPlugin("local.vam.allpackageslinker", "AllPackagesLinker", "1.3.6")]
 public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
-    private const string PluginVersion = "1.3.5";
+    private const string PluginVersion = "1.3.6";
     private const string TimelineConverterVersion = "timeline-optimized-v1";
     private const long MaxLargeSceneTextBytes = 1024L * 1024L * 1024L;
     private const string LinkRootName = "_AllPackagesLinkerLinks";
@@ -30,6 +30,10 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
     private const int MaxPendingVrOpenRetries = 40;
     private const int MaxScenePrewarmTextures = 32;
     private const float SceneLoadDispatchDelay = 0.10f;
+    private const float SceneLoadProfilePollInterval = 0.25f;
+    private const float SceneLoadProfileStableSeconds = 2.0f;
+    private const float SceneLoadProfileNoLoadingGraceSeconds = 5.0f;
+    private const float SceneLoadProfileTimeoutSeconds = 180.0f;
     private const int SYMBOLIC_LINK_FLAG_FILE = 0x0;
     private const int SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE = 0x2;
 
@@ -190,6 +194,19 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
     private HashSet<string> favoriteScenes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
     private HashSet<string> defaultUids = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
     private bool scanned=false, scanning=false, lastCombo=false, updateLoopSeen=false; private int page=0, pageSize=64; private string activeCat="Scenes", status="", pendingScenePath=""; private PackageLite selected;
+    private int pendingSceneExpectedAtomCount = 0;
+    private bool sceneLoadProfileActive = false;
+    private bool sceneLoadProfileSeenLoading = false;
+    private bool sceneLoadProfileLastLoading = false;
+    private float sceneLoadProfileStartedAt = 0f;
+    private float sceneLoadProfileNextPollAt = 0f;
+    private float sceneLoadProfileLastChangeAt = 0f;
+    private int sceneLoadProfileExpectedAtoms = 0;
+    private int sceneLoadProfileLastAtomCount = -1;
+    private int sceneLoadProfileChangeEvents = 0;
+    private string sceneLoadProfilePath = "";
+    private string sceneLoadProfileLastAdded = "";
+    private HashSet<string> sceneLoadProfileAtoms = new HashSet<string>(StringComparer.Ordinal);
     private string favSubCat = "All"; // All, Scenes, Looks, Scripts, Presets
     private Dictionary<string, int> tabPages = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
     private List<Button> favSubBtns = new List<Button>();
@@ -369,6 +386,7 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
                 nextHeartbeat = Time.realtimeSinceStartup + 10f;
                 DebugLog("Heartbeat. t=" + Time.realtimeSinceStartup.ToString("0.0") + ", canvas=" + (canvas != null) + ", scanned=" + scanned + ", scanning=" + scanning + ", packages=" + all.Count + ", superController=" + (SuperController.singleton != null) + ", unity=" + PressedJoystickButtons() + ", steamvr=" + OneLine(lastSteamVRDiag, 160) + ", openvr=" + OneLine(lastOpenVRDiag, 160));
             }
+            PollSceneLoadProfile(false);
             if (canvas != null && isVRMode && vrCanvasWaitingForPlacement && Time.realtimeSinceStartup >= nextVrPlacementRetryAt) {
                 nextVrPlacementRetryAt = Time.realtimeSinceStartup + 0.5f;
                 if (CanPlaceVrCanvas()) {
@@ -6123,7 +6141,9 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
             if(result.errors.Count>0) msg+=" | 错误："+string.Join("；",result.errors.ToArray());
             SetStatus(msg,true);
             DebugLog("LoadPackageScene prep timings: autoDeleted="+autoDeleted+", rootDepsMs="+rootDepsSw.Elapsed.TotalMilliseconds.ToString("0")+", sceneReadMs="+sceneReadMs.ToString("0")+", timelineCacheHit="+timelineInfo.cacheHit+", timelineOptimized="+timelineInfo.optimized+", timelineReadMs="+timelineInfo.readMs.ToString("0")+", timelineOptimizeMs="+timelineInfo.optimizeMs.ToString("0")+", timelineCacheReadMs="+timelineInfo.cacheReadMs.ToString("0")+", timelineSourceBytes="+timelineInfo.sourceBytes+", timelineOutputBytes="+timelineInfo.outputBytes+", timelineAnimations="+timelineInfo.animations+", timelineCurves="+timelineInfo.curves+", timelineKeys="+timelineInfo.keyframes+", sceneRefsMs="+sceneRefsMs.ToString("0")+", sceneVariantMs="+sceneVariantMs.ToString("0")+", localizeMs="+localizeMs.ToString("0")+", linkMs="+linkSw.Elapsed.TotalMilliseconds.ToString("0")+", refreshMs="+refreshMs.ToString("0")+", totalMs="+totalSw.Elapsed.TotalMilliseconds.ToString("0")+", created="+result.created+", already="+result.already+", missing="+result.missing.Count+", errors="+result.errors.Count+", localizedScripts="+localizedScripts+", localizedScriptsChanged="+localizedScriptsChanged+", localizationErrors="+localizationErrors.Count+", mode="+SceneLoadModeName(sceneLoadMode)+", primary="+scenePrimaryPersonId+", deferred="+pendingDeferredAtomCount+", sceneLoadPath="+sceneLoadPath);
-            if(result.errors.Count==0 && SuperController.singleton!=null) ScheduleSceneLoad(sceneLoadPath);
+            int expectedAtoms = sceneVariant != null ? sceneVariant.keptAtoms
+                : (selectedSceneAnalysis != null && string.Equals(selectedSceneAnalysis.key, requestedSceneKey, StringComparison.OrdinalIgnoreCase) ? selectedSceneAnalysis.atoms.Count : 0);
+            if(result.errors.Count==0 && SuperController.singleton!=null) ScheduleSceneLoad(sceneLoadPath, expectedAtoms);
             else {
                 ClearPendingDeferredScene();
                 if (SuperController.singleton == null) SetStatus("加载场景失败：SuperController 为空 | " + sceneRef, true);
@@ -6153,12 +6173,14 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         CancelInvoke("DoDelayedSceneLoad");
         CancelInvoke("TryDispatchSceneLoadAfterPrewarm");
         pendingScenePath="";
+        pendingSceneExpectedAtomCount=0;
     }
     private void ClearPendingDeferredScene(){ pendingDeferredScenePath=""; pendingDeferredAtomCount=0; }
-    private void ScheduleSceneLoad(string scenePath){
+    private void ScheduleSceneLoad(string scenePath, int expectedAtoms){
         CancelPendingSceneLoad();
         pendingScenePath=scenePath;
-        DebugLog("Scene load scheduled: "+scenePath+" | loadDelay="+SceneLoadDispatchDelay.ToString("0.00")+"s; package refresh already completed synchronously when needed.");
+        pendingSceneExpectedAtomCount=Math.Max(0,expectedAtoms);
+        DebugLog("Scene load scheduled: "+scenePath+" | expectedAtoms="+pendingSceneExpectedAtomCount+", loadDelay="+SceneLoadDispatchDelay.ToString("0.00")+"s; package refresh already completed synchronously when needed.");
         CancelInvoke("DoDelayedSceneLoad");
         CancelInvoke("TryDispatchSceneLoadAfterPrewarm");
         if(scenePrewarmPending>0 && !string.IsNullOrEmpty(scenePrewarmKey)){
@@ -6176,15 +6198,19 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
     }
     private void DoDelayedSceneLoad() {
         string scenePath = pendingScenePath;
+        int expectedAtoms = pendingSceneExpectedAtomCount;
         pendingScenePath = "";
+        pendingSceneExpectedAtomCount = 0;
         Stopwatch loadSw = Stopwatch.StartNew();
         try {
             DebugLog("Calling SuperController.Load: " + scenePath + ", superController=" + (SuperController.singleton != null));
             if (string.IsNullOrEmpty(scenePath)) throw new InvalidOperationException("待加载场景路径为空");
             if (SuperController.singleton != null) {
+                BeginSceneLoadProfile(scenePath, expectedAtoms);
                 SuperController.singleton.Load(scenePath);
                 loadSw.Stop();
                 DebugLog("SuperController.Load returned: path=" + scenePath + ", elapsedMs=" + loadSw.Elapsed.TotalMilliseconds.ToString("0"));
+                PollSceneLoadProfile(true);
                 CancelInvoke("PatchLoadedPackageScriptPluginUrls");
                 Invoke("PatchLoadedPackageScriptPluginUrls", 3.0f);
                 Invoke("PatchLoadedPackageScriptPluginUrls", 6.0f);
@@ -6202,11 +6228,127 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
             }
         } catch(Exception e) {
             loadSw.Stop();
+            FinishSceneLoadProfile("load-call-failed");
             ClearPendingDeferredScene();
             if (canvas != null) UpdateInspectorVisibility();
             DebugLog("DoDelayedSceneLoad FAILED after " + loadSw.Elapsed.TotalMilliseconds.ToString("0") + "ms: " + e.ToString());
             SetStatus("加载场景失败：" + e.Message + " | " + scenePath, true);
         }
+    }
+    private void BeginSceneLoadProfile(string scenePath, int expectedAtoms) {
+        if (sceneLoadProfileActive) FinishSceneLoadProfile("replaced-by-new-load");
+        sceneLoadProfileActive = true;
+        sceneLoadProfileSeenLoading = false;
+        sceneLoadProfileLastLoading = false;
+        sceneLoadProfileStartedAt = Time.realtimeSinceStartup;
+        sceneLoadProfileNextPollAt = sceneLoadProfileStartedAt;
+        sceneLoadProfileLastChangeAt = sceneLoadProfileStartedAt;
+        sceneLoadProfileExpectedAtoms = Math.Max(0, expectedAtoms);
+        sceneLoadProfileLastAtomCount = -1;
+        sceneLoadProfileChangeEvents = 0;
+        sceneLoadProfilePath = scenePath ?? "";
+        sceneLoadProfileLastAdded = "";
+        sceneLoadProfileAtoms.Clear();
+        DebugLog("[SceneLoadProfile] begin path=" + sceneLoadProfilePath + ", expectedAtoms=" + sceneLoadProfileExpectedAtoms);
+    }
+    private void PollSceneLoadProfile(bool force) {
+        if (!sceneLoadProfileActive) return;
+        float now = Time.realtimeSinceStartup;
+        if (!force && now < sceneLoadProfileNextPollAt) return;
+        sceneLoadProfileNextPollAt = now + SceneLoadProfilePollInterval;
+        try {
+            SuperController sc = SuperController.singleton;
+            if (sc == null) { FinishSceneLoadProfile("super-controller-missing"); return; }
+            bool loading = sc.isLoading;
+            if (loading) sceneLoadProfileSeenLoading = true;
+            if (sceneLoadProfileLastAtomCount < 0 || loading != sceneLoadProfileLastLoading) {
+                DebugLog("[SceneLoadProfile] loading=" + loading + ", elapsedMs=" + SceneLoadProfileElapsedMs(now).ToString("0"));
+                sceneLoadProfileLastLoading = loading;
+            }
+
+            List<Atom> atoms = sc.GetAtoms();
+            HashSet<string> current = new HashSet<string>(StringComparer.Ordinal);
+            Dictionary<string, int> types = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            List<string> added = new List<string>();
+            List<string> removed = new List<string>();
+            if (atoms != null) {
+                for (int i = 0; i < atoms.Count; i++) {
+                    Atom atom = atoms[i];
+                    if (atom == null) continue;
+                    string uid = atom.uid ?? "";
+                    string type = string.IsNullOrEmpty(atom.type) ? "?" : atom.type;
+                    string key = uid + ListSep + type;
+                    current.Add(key);
+                    int typeCount;
+                    types.TryGetValue(type, out typeCount);
+                    types[type] = typeCount + 1;
+                    if (sceneLoadProfileLastAtomCount >= 0 && !sceneLoadProfileAtoms.Contains(key)) added.Add(type + ":" + uid);
+                }
+            }
+            if (sceneLoadProfileLastAtomCount >= 0) {
+                foreach (string key in sceneLoadProfileAtoms) {
+                    if (!current.Contains(key)) removed.Add(SceneLoadProfileAtomLabel(key));
+                }
+            }
+            bool atomsChanged = sceneLoadProfileLastAtomCount < 0 || current.Count != sceneLoadProfileLastAtomCount || added.Count > 0 || removed.Count > 0;
+            if (atomsChanged) {
+                sceneLoadProfileLastChangeAt = now;
+                sceneLoadProfileChangeEvents++;
+                if (added.Count > 0) sceneLoadProfileLastAdded = added[added.Count - 1];
+                DebugLog("[SceneLoadProfile] atoms elapsedMs=" + SceneLoadProfileElapsedMs(now).ToString("0")
+                    + ", count=" + current.Count + "/" + sceneLoadProfileExpectedAtoms
+                    + ", added=" + SceneLoadProfileList(added, 12)
+                    + ", removed=" + SceneLoadProfileList(removed, 12)
+                    + ", types=" + SceneLoadProfileTypes(types));
+                sceneLoadProfileAtoms = current;
+                sceneLoadProfileLastAtomCount = current.Count;
+            }
+
+            float elapsed = now - sceneLoadProfileStartedAt;
+            float stable = now - sceneLoadProfileLastChangeAt;
+            if (sceneLoadProfileSeenLoading && !loading && stable >= SceneLoadProfileStableSeconds) FinishSceneLoadProfile("loading-finished");
+            else if (!sceneLoadProfileSeenLoading && sceneLoadProfileExpectedAtoms > 0 && current.Count >= sceneLoadProfileExpectedAtoms && stable >= SceneLoadProfileStableSeconds) FinishSceneLoadProfile("expected-atoms-stable");
+            else if (!sceneLoadProfileSeenLoading && !loading && elapsed >= SceneLoadProfileNoLoadingGraceSeconds && stable >= SceneLoadProfileNoLoadingGraceSeconds) FinishSceneLoadProfile("no-loading-observed-stable");
+            else if (elapsed >= SceneLoadProfileTimeoutSeconds) FinishSceneLoadProfile("timeout");
+        } catch(Exception e) {
+            DebugLog("[SceneLoadProfile] poll failed: " + e.Message);
+            if (Time.realtimeSinceStartup - sceneLoadProfileStartedAt >= SceneLoadProfileTimeoutSeconds) FinishSceneLoadProfile("timeout-after-poll-error");
+        }
+    }
+    private double SceneLoadProfileElapsedMs(float now) { return Math.Max(0f, now - sceneLoadProfileStartedAt) * 1000.0; }
+    private static string SceneLoadProfileAtomLabel(string key) {
+        int split = key.IndexOf(ListSep, StringComparison.Ordinal);
+        if (split < 0) return key;
+        return key.Substring(split + ListSep.Length) + ":" + key.Substring(0, split);
+    }
+    private static string SceneLoadProfileList(List<string> values, int limit) {
+        if (values == null || values.Count == 0) return "-";
+        int count = Math.Min(limit, values.Count);
+        string[] shown = new string[count];
+        for (int i = 0; i < count; i++) shown[i] = values[i];
+        return string.Join("|", shown) + (values.Count > count ? "|+" + (values.Count - count) : "");
+    }
+    private static string SceneLoadProfileTypes(Dictionary<string, int> types) {
+        if (types == null || types.Count == 0) return "-";
+        List<string> names = new List<string>(types.Keys);
+        names.Sort(StringComparer.OrdinalIgnoreCase);
+        string[] parts = new string[names.Count];
+        for (int i = 0; i < names.Count; i++) parts[i] = names[i] + ":" + types[names[i]];
+        return string.Join("|", parts);
+    }
+    private void FinishSceneLoadProfile(string reason) {
+        if (!sceneLoadProfileActive) return;
+        float now = Time.realtimeSinceStartup;
+        DebugLog("[SceneLoadProfile] complete reason=" + reason
+            + ", elapsedMs=" + SceneLoadProfileElapsedMs(now).ToString("0")
+            + ", loadingSeen=" + sceneLoadProfileSeenLoading
+            + ", count=" + Math.Max(0, sceneLoadProfileLastAtomCount) + "/" + sceneLoadProfileExpectedAtoms
+            + ", changeEvents=" + sceneLoadProfileChangeEvents
+            + ", lastChangeMs=" + SceneLoadProfileElapsedMs(sceneLoadProfileLastChangeAt).ToString("0")
+            + ", lastAdded=" + (string.IsNullOrEmpty(sceneLoadProfileLastAdded) ? "-" : sceneLoadProfileLastAdded)
+            + ", path=" + sceneLoadProfilePath);
+        sceneLoadProfileActive = false;
+        sceneLoadProfileAtoms.Clear();
     }
     private void LoadDeferredSceneAtoms(){
         string path=pendingDeferredScenePath;
