@@ -20,9 +20,9 @@ using MVR.FileManagement;
 using Valve.VR;
 using HarmonyLib;
 
-[BepInPlugin("local.vam.allpackageslinker", "AllPackagesLinker", "1.3.7")]
+[BepInPlugin("local.vam.allpackageslinker", "AllPackagesLinker", "1.3.8")]
 public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
-    private const string PluginVersion = "1.3.7";
+    private const string PluginVersion = "1.3.8";
     private const string TimelineConverterVersion = "timeline-optimized-v1";
     private const long MaxLargeSceneTextBytes = 1024L * 1024L * 1024L;
     private const string LinkRootName = "_AllPackagesLinkerLinks";
@@ -38,6 +38,7 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
     private const float SceneLoadProfileNoLoadingGraceSeconds = 5.0f;
     private const float SceneLoadProfileTimeoutSeconds = 180.0f;
     private const string TextureFinishHarmonyId = "local.vam.allpackageslinker.texture-finish";
+    private const string AssetCallbackHarmonyId = "local.vam.allpackageslinker.asset-callback";
     private const int TextureFinishVanillaLimit = 4;
     private const int SYMBOLIC_LINK_FLAG_FILE = 0x0;
     private const int SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE = 0x2;
@@ -212,6 +213,18 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
     private string sceneLoadProfilePath = "";
     private string sceneLoadProfileLastAdded = "";
     private HashSet<string> sceneLoadProfileAtoms = new HashSet<string>(StringComparer.Ordinal);
+    private bool sceneLoadProfileHoldsInitialized = false;
+    private int sceneLoadProfileMaxPendingHolds = 0;
+    private float sceneLoadProfileLongestHoldSeconds = 0f;
+    private string sceneLoadProfileLongestHold = "";
+    private string sceneLoadProfileLastCompletedHold = "";
+    private HashSet<AsyncFlag> sceneLoadProfilePendingHolds = new HashSet<AsyncFlag>();
+    private Dictionary<AsyncFlag, float> sceneLoadProfileHoldFirstSeen = new Dictionary<AsyncFlag, float>();
+    private Dictionary<AsyncFlag, string> sceneLoadProfileHoldLabels = new Dictionary<AsyncFlag, string>();
+    private FieldInfo sceneHoldLoadCompleteFlagsField = null;
+    private FieldInfo sceneCuaLoadingFlagField = null;
+    private FieldInfo sceneCuaAssetUrlField = null;
+    private FieldInfo sceneCuaResolvedUrlField = null;
     private string favSubCat = "All"; // All, Scenes, Looks, Scripts, Presets
     private Dictionary<string, int> tabPages = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
     private List<Button> favSubBtns = new List<Button>();
@@ -246,10 +259,23 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
     private bool autoCleanLinksBeforeSceneLoad = false;
     private bool sceneTexturePrewarmEnabled = true;
     private int textureFinishGear = 1; // 0=vanilla 4, 1=balanced 8, 2=fast 12, 3=extreme 16
+    private int assetCallbackGear = 2; // 0=ordered, 1=2/frame, 2=4/frame, 3=8/frame
     private Harmony textureFinishHarmony = null;
     private static AllPackagesLinkerBepInEx textureFinishOwner = null;
     private static bool textureFinishPatchApplied = false;
     private static int textureFinishTranspilerHits = 0;
+    private Harmony assetCallbackHarmony = null;
+    private static AllPackagesLinkerBepInEx assetCallbackOwner = null;
+    private static bool assetCallbackPatchApplied = false;
+    private static int assetWorkerTranspilerHits = 0;
+    private static FieldInfo assetCompletionQueueField = null;
+    private static FieldInfo assetRequestLoadCompletedField = null;
+    private int sceneLoadProfileAssetCallbacks = 0;
+    private int sceneLoadProfileOutOfOrderCallbacks = 0;
+    private int sceneLoadProfileMaxCallbackScanAhead = 0;
+    private double sceneLoadProfileAssetCallbackWorkMs = 0.0;
+    private double sceneLoadProfileSlowestAssetCallbackMs = 0.0;
+    private string sceneLoadProfileSlowestAssetCallback = "";
     private int sceneLoadMode = 0; // 0=full, 1=primary, 2=minimal
     private string scenePrimaryPersonId = "";
     private SceneJsonAnalysis selectedSceneAnalysis = null;
@@ -340,6 +366,7 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
             DebugLog("Builtin font loaded=" + (font != null));
             LoadConfig();
             InstallTextureFinishPatch();
+            InstallAssetCallbackPatch();
             configuredDownloadRoot = missingDepsDownloadRoot;
             string linkedDownloadRoot = ResolveLinkedLibraryDownloadRoot(missingDepsDownloadRoot);
             if (!string.Equals(linkedDownloadRoot, missingDepsDownloadRoot, StringComparison.OrdinalIgnoreCase)) {
@@ -615,6 +642,7 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
 
     private void OnDestroy() {
         DebugLog("OnDestroy.");
+        UninstallAssetCallbackPatch();
         UninstallTextureFinishPatch();
         missingDepsDownloadCancelRequested=true;
         StopActiveHubProcess();
@@ -713,6 +741,149 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         SaveConfig();
         string patchState = textureFinishPatchApplied ? "已启用" : "补丁未生效，仍为原版 4";
         SetStatus("纹理收尾挡位：" + TextureFinishGearName(textureFinishGear) + " " + TextureFinishLimitForGear(textureFinishGear) + "（" + patchState + "）", true);
+    }
+    private void InstallAssetCallbackPatch() {
+        assetCallbackOwner = this;
+        assetCallbackPatchApplied = false;
+        assetWorkerTranspilerHits = 0;
+        try {
+            Type loaderType = typeof(MeshVR.AssetLoader);
+            Type requestType = typeof(MeshVR.AssetLoader.AssetBundleFromFileRequest);
+            MethodInfo target = AccessTools.Method(loaderType, "CallbackDispatcher");
+            MethodInfo prefix = AccessTools.Method(typeof(AllPackagesLinkerBepInEx), "AssetCallbackDispatcherPrefix");
+            MethodInfo startTarget = AccessTools.Method(loaderType, "Start");
+            MethodInfo workerTranspiler = AccessTools.Method(typeof(AllPackagesLinkerBepInEx), "AssetWorkerCountTranspiler");
+            assetCompletionQueueField = AccessTools.Field(loaderType, "_completionQueue");
+            assetRequestLoadCompletedField = AccessTools.Field(requestType, "loadCompleted");
+            if (object.ReferenceEquals(target, null) || object.ReferenceEquals(prefix, null)
+                || object.ReferenceEquals(startTarget, null) || object.ReferenceEquals(workerTranspiler, null)
+                || object.ReferenceEquals(assetCompletionQueueField, null) || object.ReferenceEquals(assetRequestLoadCompletedField, null)) {
+                throw new MissingMemberException("reinforced AssetLoader callback members not found");
+            }
+            assetCallbackHarmony = new Harmony(AssetCallbackHarmonyId);
+            assetCallbackHarmony.Patch(target, new HarmonyMethod(prefix));
+            assetCallbackHarmony.Patch(startTarget, null, null, new HarmonyMethod(workerTranspiler));
+            if (assetWorkerTranspilerHits != 2) throw new InvalidOperationException("expected two AssetLoader worker constants, matched " + assetWorkerTranspilerHits);
+            assetCallbackPatchApplied = true;
+            DebugLog("Asset callback patch installed. gear=" + AssetCallbackGearName(assetCallbackGear)
+                + ", workers=" + AssetWorkerCountForGear(assetCallbackGear)
+                + ", loadingBudget=" + AssetCallbackBudgetForGear(assetCallbackGear));
+        } catch (Exception e) {
+            try { if (assetCallbackHarmony != null) assetCallbackHarmony.UnpatchAll(AssetCallbackHarmonyId); } catch {}
+            assetCallbackHarmony = null;
+            assetCallbackPatchApplied = false;
+            Logger.LogWarning("Asset callback acceleration disabled; ordered dispatcher remains active: " + e.Message);
+            DebugLog("Asset callback patch failed: " + e.ToString());
+        }
+    }
+    private void UninstallAssetCallbackPatch() {
+        try { if (assetCallbackHarmony != null) assetCallbackHarmony.UnpatchAll(AssetCallbackHarmonyId); }
+        catch (Exception e) { Logger.LogWarning("Asset callback patch cleanup failed: " + e.Message); }
+        assetCallbackHarmony = null;
+        assetCallbackPatchApplied = false;
+        if (object.ReferenceEquals(assetCallbackOwner, this)) assetCallbackOwner = null;
+    }
+    private static bool AssetCallbackDispatcherPrefix(MeshVR.AssetLoader __instance, ref IEnumerator __result) {
+        __result = AssetCallbackDispatcherReplacement(__instance);
+        return false;
+    }
+    private static IEnumerable<CodeInstruction> AssetWorkerCountTranspiler(IEnumerable<CodeInstruction> instructions) {
+        List<CodeInstruction> codes = new List<CodeInstruction>(instructions);
+        MethodInfo countMethod = AccessTools.Method(typeof(AllPackagesLinkerBepInEx), "AssetWorkerCountForCurrentGear");
+        int hits = 0;
+        if (!object.ReferenceEquals(countMethod, null)) {
+            for (int i = 0; i < codes.Count; i++) {
+                if (codes[i].opcode != OpCodes.Ldc_I4_8) continue;
+                codes[i].opcode = OpCodes.Call;
+                codes[i].operand = countMethod;
+                hits++;
+            }
+        }
+        assetWorkerTranspilerHits = hits;
+        return codes;
+    }
+    private static int AssetWorkerCountForCurrentGear() {
+        AllPackagesLinkerBepInEx owner = assetCallbackOwner;
+        return AssetWorkerCountForGear(owner == null ? 0 : owner.assetCallbackGear);
+    }
+    private static IEnumerator AssetCallbackDispatcherReplacement(MeshVR.AssetLoader loader) {
+        while (true) {
+            AllPackagesLinkerBepInEx owner = assetCallbackOwner;
+            try {
+                List<MeshVR.AssetLoader.AssetBundleFromFileRequest> queue = assetCompletionQueueField.GetValue(loader) as List<MeshVR.AssetLoader.AssetBundleFromFileRequest>;
+                if (queue != null && queue.Count > 0) {
+                    SuperController sc = SuperController.singleton;
+                    int gear = owner != null && sc != null && sc.isLoading ? owner.assetCallbackGear : 0;
+                    int budget = gear <= 0 ? int.MaxValue : AssetCallbackBudgetForGear(gear);
+                    int dispatched = 0;
+                    for (int i = 0; i < queue.Count && dispatched < budget;) {
+                        MeshVR.AssetLoader.AssetBundleFromFileRequest request = queue[i];
+                        bool completed = request != null && (bool)assetRequestLoadCompletedField.GetValue(request);
+                        if (!completed) {
+                            if (gear <= 0) break;
+                            i++;
+                            continue;
+                        }
+                        bool outOfOrder = i > 0;
+                        int scanAhead = i;
+                        queue.RemoveAt(i);
+                        Stopwatch callbackSw = Stopwatch.StartNew();
+                        try {
+                            if (request.callback != null) request.callback(request);
+                        } catch (Exception e) {
+                            if (owner != null) owner.DebugLog("Asset callback failed: path=" + request.path + ", error=" + e.ToString());
+                        }
+                        callbackSw.Stop();
+                        if (owner != null) owner.RecordAssetCallback(request.path, outOfOrder, scanAhead, callbackSw.Elapsed.TotalMilliseconds);
+                        dispatched++;
+                    }
+                }
+            } catch (Exception e) {
+                if (owner != null) owner.DebugLog("Asset callback dispatcher failed: " + e.ToString());
+            }
+            yield return null;
+        }
+    }
+    private void RecordAssetCallback(string path, bool outOfOrder, int scanAhead, double elapsedMs) {
+        if (!sceneLoadProfileActive) return;
+        sceneLoadProfileAssetCallbacks++;
+        if (outOfOrder) sceneLoadProfileOutOfOrderCallbacks++;
+        if (scanAhead > sceneLoadProfileMaxCallbackScanAhead) sceneLoadProfileMaxCallbackScanAhead = scanAhead;
+        sceneLoadProfileAssetCallbackWorkMs += elapsedMs;
+        if (elapsedMs > sceneLoadProfileSlowestAssetCallbackMs) {
+            sceneLoadProfileSlowestAssetCallbackMs = elapsedMs;
+            sceneLoadProfileSlowestAssetCallback = SceneLoadProfileLogValue(path);
+        }
+    }
+    private static int AssetCallbackBudgetForGear(int gear) {
+        switch (Mathf.Clamp(gear, 0, 3)) {
+            case 1: return 2;
+            case 2: return 4;
+            case 3: return 8;
+            default: return 0;
+        }
+    }
+    private static int AssetWorkerCountForGear(int gear) {
+        switch (Mathf.Clamp(gear, 0, 3)) {
+            case 2: return 12;
+            case 3: return 16;
+            default: return 8;
+        }
+    }
+    private static string AssetCallbackGearName(int gear) {
+        switch (Mathf.Clamp(gear, 0, 3)) {
+            case 1: return "均衡";
+            case 2: return "高速";
+            case 3: return "极限";
+            default: return "顺序";
+        }
+    }
+    private void SetAssetCallbackGear(int gear) {
+        assetCallbackGear = Mathf.Clamp(gear, 0, 3);
+        SaveConfig();
+        string patchState = assetCallbackPatchApplied ? "已启用" : "补丁未生效，保持顺序";
+        SetStatus("CUA 加载挡位：" + AssetCallbackGearName(assetCallbackGear)
+            + " " + AssetWorkerCountForGear(assetCallbackGear) + " Worker / " + AssetCallbackBudgetForGear(assetCallbackGear) + " 回调每帧（" + patchState + "）", true);
     }
     private void StopActiveHubProcess() {
         Process p = activeHubProcess; activeHubProcess = null;
@@ -1798,6 +1969,7 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
                 if(k=="autoCleanLinksBeforeSceneLoad") autoCleanLinksBeforeSceneLoad=(v=="1" || v.Equals("true", StringComparison.OrdinalIgnoreCase));
                 if(k=="sceneTexturePrewarmEnabled") sceneTexturePrewarmEnabled=(v=="1" || v.Equals("true", StringComparison.OrdinalIgnoreCase));
                 if(k=="textureFinishGear" && int.TryParse(v,out iv)) textureFinishGear=Mathf.Clamp(iv,0,3);
+                if(k=="assetCallbackGear" && int.TryParse(v,out iv)) assetCallbackGear=Mathf.Clamp(iv,0,3);
                 if(k=="sceneLoadMode" && int.TryParse(v,out iv)) sceneLoadMode=Mathf.Clamp(iv,0,2);
                 if(k=="missingDepsDownloadRoot" && !string.IsNullOrEmpty(v)) missingDepsDownloadRoot=v;
                 if(k=="vrRotationEnabled") vrRotationEnabled=(v=="1" || v.Equals("true", StringComparison.OrdinalIgnoreCase));
@@ -1832,6 +2004,7 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
             sb.Append("autoCleanLinksBeforeSceneLoad=").Append(autoCleanLinksBeforeSceneLoad?"1":"0").Append('\n');
             sb.Append("sceneTexturePrewarmEnabled=").Append(sceneTexturePrewarmEnabled?"1":"0").Append('\n');
             sb.Append("textureFinishGear=").Append(textureFinishGear).Append('\n');
+            sb.Append("assetCallbackGear=").Append(assetCallbackGear).Append('\n');
             sb.Append("sceneLoadMode=").Append(sceneLoadMode).Append('\n');
             sb.Append("missingDepsDownloadRoot=").Append(missingDepsDownloadRoot).Append('\n');
             sb.Append("vrRotationEnabled=").Append(vrRotationEnabled?"1":"0").Append('\n');
@@ -6363,6 +6536,20 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         sceneLoadProfilePath = scenePath ?? "";
         sceneLoadProfileLastAdded = "";
         sceneLoadProfileAtoms.Clear();
+        sceneLoadProfileHoldsInitialized = false;
+        sceneLoadProfileMaxPendingHolds = 0;
+        sceneLoadProfileLongestHoldSeconds = 0f;
+        sceneLoadProfileLongestHold = "";
+        sceneLoadProfileLastCompletedHold = "";
+        sceneLoadProfileAssetCallbacks = 0;
+        sceneLoadProfileOutOfOrderCallbacks = 0;
+        sceneLoadProfileMaxCallbackScanAhead = 0;
+        sceneLoadProfileAssetCallbackWorkMs = 0.0;
+        sceneLoadProfileSlowestAssetCallbackMs = 0.0;
+        sceneLoadProfileSlowestAssetCallback = "";
+        sceneLoadProfilePendingHolds.Clear();
+        sceneLoadProfileHoldFirstSeen.Clear();
+        sceneLoadProfileHoldLabels.Clear();
         DebugLog("[SceneLoadProfile] begin path=" + sceneLoadProfilePath + ", expectedAtoms=" + sceneLoadProfileExpectedAtoms);
     }
     private void PollSceneLoadProfile(bool force) {
@@ -6379,6 +6566,7 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
                 DebugLog("[SceneLoadProfile] loading=" + loading + ", elapsedMs=" + SceneLoadProfileElapsedMs(now).ToString("0"));
                 sceneLoadProfileLastLoading = loading;
             }
+            PollSceneHoldLoadProfile(sc, now);
 
             List<Atom> atoms = sc.GetAtoms();
             HashSet<string> current = new HashSet<string>(StringComparer.Ordinal);
@@ -6429,6 +6617,113 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
             if (Time.realtimeSinceStartup - sceneLoadProfileStartedAt >= SceneLoadProfileTimeoutSeconds) FinishSceneLoadProfile("timeout-after-poll-error");
         }
     }
+    private void PollSceneHoldLoadProfile(SuperController sc, float now) {
+        if (object.ReferenceEquals(sceneHoldLoadCompleteFlagsField, null)) sceneHoldLoadCompleteFlagsField = typeof(SuperController).GetField("holdLoadCompleteFlags", BindingFlags.Instance | BindingFlags.NonPublic);
+        if (object.ReferenceEquals(sceneHoldLoadCompleteFlagsField, null)) {
+            if (!sceneLoadProfileHoldsInitialized) DebugLog("[SceneLoadProfile] holds unavailable: holdLoadCompleteFlags field not found");
+            sceneLoadProfileHoldsInitialized = true;
+            return;
+        }
+        List<AsyncFlag> flags = sceneHoldLoadCompleteFlagsField.GetValue(sc) as List<AsyncFlag>;
+        if (flags == null) {
+            return;
+        }
+
+        HashSet<AsyncFlag> pending = new HashSet<AsyncFlag>();
+        for (int i = 0; i < flags.Count; i++) {
+            AsyncFlag flag = flags[i];
+            if (flag == null) continue;
+            if (!sceneLoadProfileHoldFirstSeen.ContainsKey(flag)) sceneLoadProfileHoldFirstSeen[flag] = now;
+            if (!flag.Raised) pending.Add(flag);
+        }
+        if (pending.Count > sceneLoadProfileMaxPendingHolds) sceneLoadProfileMaxPendingHolds = pending.Count;
+
+        bool changed = !sceneLoadProfileHoldsInitialized || !pending.SetEquals(sceneLoadProfilePendingHolds);
+        if (!changed) {
+            UpdateSceneLongestHold(pending, now);
+            return;
+        }
+
+        RefreshSceneCuaHoldLabels(pending);
+        List<string> completed = new List<string>();
+        foreach (AsyncFlag flag in sceneLoadProfilePendingHolds) {
+            if (pending.Contains(flag)) continue;
+            float waitSeconds = SceneHoldWaitSeconds(flag, now);
+            string label = SceneHoldLabel(flag);
+            completed.Add(label + "@" + (waitSeconds * 1000f).ToString("0") + "ms");
+            sceneLoadProfileLastCompletedHold = label;
+            UpdateSceneLongestHold(label, waitSeconds);
+        }
+        List<string> waiting = new List<string>();
+        foreach (AsyncFlag flag in pending) {
+            float waitSeconds = SceneHoldWaitSeconds(flag, now);
+            string label = SceneHoldLabel(flag);
+            waiting.Add(label + "@" + (waitSeconds * 1000f).ToString("0") + "ms");
+            UpdateSceneLongestHold(label, waitSeconds);
+        }
+        waiting.Sort(StringComparer.OrdinalIgnoreCase);
+        completed.Sort(StringComparer.OrdinalIgnoreCase);
+        DebugLog("[SceneLoadProfile] holds elapsedMs=" + SceneLoadProfileElapsedMs(now).ToString("0")
+            + ", tracked=" + flags.Count
+            + ", pending=" + pending.Count
+            + ", completed=" + SceneLoadProfileList(completed, 12)
+            + ", waiting=" + SceneLoadProfileList(waiting, 12));
+        sceneLoadProfilePendingHolds = pending;
+        sceneLoadProfileHoldsInitialized = true;
+    }
+    private void RefreshSceneCuaHoldLabels(HashSet<AsyncFlag> pending) {
+        bool needsRefresh = false;
+        foreach (AsyncFlag flag in pending) {
+            if (!sceneLoadProfileHoldLabels.ContainsKey(flag)) { needsRefresh = true; break; }
+        }
+        if (!needsRefresh) return;
+        if (object.ReferenceEquals(sceneCuaLoadingFlagField, null)) sceneCuaLoadingFlagField = typeof(CustomUnityAssetLoader).GetField("isLoadingFlag", BindingFlags.Instance | BindingFlags.NonPublic);
+        if (object.ReferenceEquals(sceneCuaAssetUrlField, null)) sceneCuaAssetUrlField = typeof(CustomUnityAssetLoader).GetField("assetUrlJSON", BindingFlags.Instance | BindingFlags.NonPublic);
+        if (object.ReferenceEquals(sceneCuaResolvedUrlField, null)) sceneCuaResolvedUrlField = typeof(CustomUnityAssetLoader).GetField("assetBundleUrl", BindingFlags.Instance | BindingFlags.NonPublic);
+        if (object.ReferenceEquals(sceneCuaLoadingFlagField, null)) return;
+        try {
+            CustomUnityAssetLoader[] loaders = UnityEngine.Object.FindObjectsOfType<CustomUnityAssetLoader>();
+            for (int i = 0; i < loaders.Length; i++) {
+                CustomUnityAssetLoader loader = loaders[i];
+                if (loader == null) continue;
+                AsyncFlag flag = sceneCuaLoadingFlagField.GetValue(loader) as AsyncFlag;
+                if (flag == null || sceneLoadProfileHoldLabels.ContainsKey(flag)) continue;
+                string uid = loader.containingAtom == null ? "?" : loader.containingAtom.uid;
+                string url = "";
+                if (!object.ReferenceEquals(sceneCuaAssetUrlField, null)) {
+                    JSONStorableUrl urlParam = sceneCuaAssetUrlField.GetValue(loader) as JSONStorableUrl;
+                    if (urlParam != null) url = urlParam.val;
+                }
+                if (string.IsNullOrEmpty(url) && !object.ReferenceEquals(sceneCuaResolvedUrlField, null)) url = sceneCuaResolvedUrlField.GetValue(loader) as string;
+                sceneLoadProfileHoldLabels[flag] = "CUA:" + SceneLoadProfileLogValue(uid) + "=>" + SceneLoadProfileLogValue(url);
+            }
+        } catch (Exception e) {
+            DebugLog("[SceneLoadProfile] CUA hold label lookup failed: " + e.Message);
+        }
+    }
+    private float SceneHoldWaitSeconds(AsyncFlag flag, float now) {
+        float firstSeen;
+        return flag != null && sceneLoadProfileHoldFirstSeen.TryGetValue(flag, out firstSeen) ? Math.Max(0f, now - firstSeen) : 0f;
+    }
+    private string SceneHoldLabel(AsyncFlag flag) {
+        if (flag == null) return "?";
+        string label;
+        if (sceneLoadProfileHoldLabels.TryGetValue(flag, out label) && !string.IsNullOrEmpty(label)) return label;
+        return SceneLoadProfileLogValue(string.IsNullOrEmpty(flag.Name) ? "unnamed" : flag.Name);
+    }
+    private void UpdateSceneLongestHold(HashSet<AsyncFlag> pending, float now) {
+        foreach (AsyncFlag flag in pending) UpdateSceneLongestHold(SceneHoldLabel(flag), SceneHoldWaitSeconds(flag, now));
+    }
+    private void UpdateSceneLongestHold(string label, float waitSeconds) {
+        if (waitSeconds <= sceneLoadProfileLongestHoldSeconds) return;
+        sceneLoadProfileLongestHoldSeconds = waitSeconds;
+        sceneLoadProfileLongestHold = label;
+    }
+    private static string SceneLoadProfileLogValue(string value) {
+        if (string.IsNullOrEmpty(value)) return "?";
+        string clean = value.Replace('\r', ' ').Replace('\n', ' ').Replace('|', '/');
+        return clean.Length <= 320 ? clean : clean.Substring(0, 317) + "...";
+    }
     private double SceneLoadProfileElapsedMs(float now) { return Math.Max(0f, now - sceneLoadProfileStartedAt) * 1000.0; }
     private static string SceneLoadProfileAtomLabel(string key) {
         int split = key.IndexOf(ListSep, StringComparison.Ordinal);
@@ -6460,9 +6755,24 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
             + ", changeEvents=" + sceneLoadProfileChangeEvents
             + ", lastChangeMs=" + SceneLoadProfileElapsedMs(sceneLoadProfileLastChangeAt).ToString("0")
             + ", lastAdded=" + (string.IsNullOrEmpty(sceneLoadProfileLastAdded) ? "-" : sceneLoadProfileLastAdded)
+            + ", maxPendingHolds=" + sceneLoadProfileMaxPendingHolds
+            + ", longestHoldMs=" + (sceneLoadProfileLongestHoldSeconds * 1000f).ToString("0")
+            + ", longestHold=" + (string.IsNullOrEmpty(sceneLoadProfileLongestHold) ? "-" : sceneLoadProfileLongestHold)
+            + ", lastCompletedHold=" + (string.IsNullOrEmpty(sceneLoadProfileLastCompletedHold) ? "-" : sceneLoadProfileLastCompletedHold)
+            + ", callbackGear=" + AssetCallbackGearName(assetCallbackGear)
+            + ", assetWorkers=" + AssetWorkerCountForGear(assetCallbackGear)
+            + ", callbacks=" + sceneLoadProfileAssetCallbacks
+            + ", outOfOrderCallbacks=" + sceneLoadProfileOutOfOrderCallbacks
+            + ", maxCallbackScanAhead=" + sceneLoadProfileMaxCallbackScanAhead
+            + ", callbackWorkMs=" + sceneLoadProfileAssetCallbackWorkMs.ToString("0")
+            + ", slowestCallbackMs=" + sceneLoadProfileSlowestAssetCallbackMs.ToString("0")
+            + ", slowestCallback=" + (string.IsNullOrEmpty(sceneLoadProfileSlowestAssetCallback) ? "-" : sceneLoadProfileSlowestAssetCallback)
             + ", path=" + sceneLoadProfilePath);
         sceneLoadProfileActive = false;
         sceneLoadProfileAtoms.Clear();
+        sceneLoadProfilePendingHolds.Clear();
+        sceneLoadProfileHoldFirstSeen.Clear();
+        sceneLoadProfileHoldLabels.Clear();
     }
     private void LoadDeferredSceneAtoms(){
         string path=pendingDeferredScenePath;
@@ -6770,6 +7080,29 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         textureFastBtn.onClick.AddListener(() => { SetTextureFinishGear(2); refreshTextureGearColors(); });
         textureExtremeBtn.onClick.AddListener(() => { SetTextureFinishGear(3); refreshTextureGearColors(); });
         refreshTextureGearColors();
+
+        Text assetCallbackTitle = MakeText(content.transform, "AssetCallbackTitle", "CUA AssetBundle（重启生效）", 14, TextAnchor.MiddleLeft, colTextSecondary);
+        SetFixedHeight(assetCallbackTitle.gameObject, 24f);
+        GameObject assetCallbackRow = CreateRow(content.transform, "AssetCallbackGear", isVRMode ? 46f : 40f, 6, true);
+        Button assetOrderedBtn = MakeButton(assetCallbackRow.transform, "顺序 8", 12, colBtn);
+        Button assetBalancedBtn = MakeButton(assetCallbackRow.transform, "均衡 8", 12, colBtn);
+        Button assetFastBtn = MakeButton(assetCallbackRow.transform, "高速 12", 12, colBtn);
+        Button assetExtremeBtn = MakeButton(assetCallbackRow.transform, "极限 16", 12, colBtn);
+        SetFlexibleItem(assetOrderedBtn.gameObject, 0f, 1f);
+        SetFlexibleItem(assetBalancedBtn.gameObject, 0f, 1f);
+        SetFlexibleItem(assetFastBtn.gameObject, 0f, 1f);
+        SetFlexibleItem(assetExtremeBtn.gameObject, 0f, 1f);
+        UiAction refreshAssetCallbackGearColors = () => {
+            SetModeButtonColor(assetOrderedBtn, assetCallbackGear == 0);
+            SetModeButtonColor(assetBalancedBtn, assetCallbackGear == 1);
+            SetModeButtonColor(assetFastBtn, assetCallbackGear == 2);
+            SetModeButtonColor(assetExtremeBtn, assetCallbackGear == 3);
+        };
+        assetOrderedBtn.onClick.AddListener(() => { SetAssetCallbackGear(0); refreshAssetCallbackGearColors(); });
+        assetBalancedBtn.onClick.AddListener(() => { SetAssetCallbackGear(1); refreshAssetCallbackGearColors(); });
+        assetFastBtn.onClick.AddListener(() => { SetAssetCallbackGear(2); refreshAssetCallbackGearColors(); });
+        assetExtremeBtn.onClick.AddListener(() => { SetAssetCallbackGear(3); refreshAssetCallbackGearColors(); });
+        refreshAssetCallbackGearColors();
 
         // VR 镜头模式：桌面/VR 设置都可配，不依赖当前面板模式
         Text gVrRot = MakeText(content.transform, "GVrRot", "VR 镜头模式", 15, TextAnchor.MiddleLeft, colAccent);
