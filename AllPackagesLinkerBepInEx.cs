@@ -775,7 +775,6 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         if (string.IsNullOrEmpty(message) || !message.StartsWith("[LoadPerf]", StringComparison.Ordinal)) return false;
         if (message.StartsWith("[LoadPerf]   [Person恢复]", StringComparison.Ordinal)
             || message.StartsWith("[LoadPerf]   Atom恢复 #", StringComparison.Ordinal)
-            || message.StartsWith("[LoadPerf]   LateRestore #", StringComparison.Ordinal)
             || message.StartsWith("[LoadPerf]   AB预加载:", StringComparison.Ordinal)
             || message.StartsWith("[LoadPerf] P16:   Person", StringComparison.Ordinal)
             || message.StartsWith("[LoadPerf] P17:   启动Person", StringComparison.Ordinal)
