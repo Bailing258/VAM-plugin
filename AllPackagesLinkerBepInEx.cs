@@ -9,6 +9,7 @@ using System.Reflection.Emit;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
+using System.Threading;
 using System.Runtime.InteropServices;
 using BepInEx;
 using UnityEngine;
@@ -20,9 +21,9 @@ using MVR.FileManagement;
 using Valve.VR;
 using HarmonyLib;
 
-[BepInPlugin("local.vam.allpackageslinker", "AllPackagesLinker", "1.3.9")]
+[BepInPlugin("local.vam.allpackageslinker", "AllPackagesLinker", "1.4.0")]
 public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
-    private const string PluginVersion = "1.3.9";
+    private const string PluginVersion = "1.4.0";
     private const string TimelineConverterVersion = "timeline-optimized-v1";
     private const long MaxLargeSceneTextBytes = 1024L * 1024L * 1024L;
     private const string LinkRootName = "_AllPackagesLinkerLinks";
@@ -140,6 +141,23 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         public string cachePath="", error="";
     }
 
+    private class CacheUsageSnapshot {
+        public long nonEssentialBytes, allBytes;
+        public int nonEssentialFiles, allFiles, errors;
+    }
+
+    private class CacheWorkerResult {
+        public string operation="", error="";
+        public CacheUsageSnapshot usage;
+        public long deletedBytes;
+        public int deletedFiles, deleteErrors;
+    }
+
+    private class CacheDeleteReport {
+        public long deletedBytes;
+        public int deletedFiles, errors;
+    }
+
     private class SceneLite {
         public PackageLite package;
         public string entryPath="", name="";
@@ -185,10 +203,13 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
     // UI refactor refs (plan.md)
     private GameObject navRoot, settingsDrawerRoot, settingsBackdropRoot, emptyStateRoot;
     private GameObject atomRowRoot, presetOptionsRoot, presetModeRoot, presetActionRoot, sceneModeRoot, scenePersonRoot, sceneActionRoot, linkActionRoot, hubRowRoot, hubDownloadRoot, progressSectionRoot, dangerRowRoot, moreActionsRoot;
-    private Text resultCountText, pageInfoText, searchPlaceholderText;
-    private Button settingsBtn, rescanTopBtn, searchClearBtn;
+    private Text resultCountText, pageInfoText, searchPlaceholderText, cacheSizeText;
+    private Button settingsBtn, rescanTopBtn, searchClearBtn, clearNonEssentialCacheBtn, clearAllCacheBtn;
     private Button loadSceneBtn, loadDeferredSceneBtn, sceneFullModeBtn, scenePrimaryModeBtn, sceneMinimalModeBtn, applyPresetBtn, loadScriptBtn, linkOnlyBtn, defaultKeepBtn, favToggleBtn;
     private bool settingsDrawerOpen = false;
+    private volatile bool cacheWorkerRunning = false;
+    private volatile CacheWorkerResult cacheWorkerResult = null;
+    private CacheUsageSnapshot lastCacheUsage = null;
     private string allSubFilter = "All";
     private string targetAtomUid = "";
     private Text atomSelectorLabel;
@@ -439,6 +460,7 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
             }
             PollSceneLoadProfile(false);
             PollDeferredCuaLoads();
+            PollCacheWorkerResult();
             if (canvas != null && isVRMode && vrCanvasWaitingForPlacement && Time.realtimeSinceStartup >= nextVrPlacementRetryAt) {
                 nextVrPlacementRetryAt = Time.realtimeSinceStartup + 0.5f;
                 if (CanPlaceVrCanvas()) {
@@ -2067,8 +2089,8 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         canvas=null; root=null; confirmRoot=null; subBarRoot=null; pageStripRoot=null; authorDropdownRoot=null; listContent=null; authorDropdownContent=null; header=null; details=null; preview=null; statusText=null; downloadProgressText=null; downloadProgressFill=null; hubDownloadButton=null; applyClothingToggle=null; applyHairToggle=null; searchInput=null; authorDropdownSearchInput=null; atomSelectorLabel=null; scenePrimaryPersonLabel=null;
         navRoot=null; settingsDrawerRoot=null; settingsBackdropRoot=null; emptyStateRoot=null;
         atomRowRoot=null; presetOptionsRoot=null; presetModeRoot=null; presetActionRoot=null; sceneModeRoot=null; scenePersonRoot=null; sceneActionRoot=null; linkActionRoot=null; hubRowRoot=null; hubDownloadRoot=null; progressSectionRoot=null; dangerRowRoot=null; moreActionsRoot=null;
-        resultCountText=null; pageInfoText=null; searchPlaceholderText=null;
-        settingsBtn=null; rescanTopBtn=null; searchClearBtn=null;
+        resultCountText=null; pageInfoText=null; searchPlaceholderText=null; cacheSizeText=null;
+        settingsBtn=null; rescanTopBtn=null; searchClearBtn=null; clearNonEssentialCacheBtn=null; clearAllCacheBtn=null;
         loadSceneBtn=null; loadDeferredSceneBtn=null; sceneFullModeBtn=null; scenePrimaryModeBtn=null; sceneMinimalModeBtn=null; applyPresetBtn=null; loadScriptBtn=null; linkOnlyBtn=null; defaultKeepBtn=null; favToggleBtn=null;
         settingsDrawerOpen=false;
         selectedPreset=null; selectedVarPreset=null; selectedSceneItem=null; selectedWearableItem=null; selected=null;
@@ -7069,6 +7091,277 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
     private void DeletePathIfExistsOrReparse(string path){ try{ if(!PathExistsOrReparse(path))return; FileAttributes a=File.GetAttributes(path); if((a&FileAttributes.Directory)!=0) Directory.Delete(path,false); else File.Delete(path); }catch(Exception e){ DebugLog("DeletePathIfExistsOrReparse failed "+path+": "+e.Message); } }
     private bool CanOpenVarFile(string path){ try{ if(string.IsNullOrEmpty(path))return false; using(FileStream fs=File.Open(path,FileMode.Open,FileAccess.Read,FileShare.ReadWrite|FileShare.Delete)){ return fs!=null; } }catch{return false;} }
     private int CleanBrokenGeneratedLinks(){ int deleted=0,errors=0; try{ if(!Directory.Exists(linkRoot))return 0; string basePath=Path.GetFullPath(linkRoot).TrimEnd(Path.DirectorySeparatorChar,Path.AltDirectorySeparatorChar)+Path.DirectorySeparatorChar; string[] files=Directory.GetFiles(linkRoot,"*.var",SearchOption.AllDirectories); for(int i=0;i<files.Length;i++){ string f=files[i]; string full=Path.GetFullPath(f); if(!full.StartsWith(basePath,StringComparison.OrdinalIgnoreCase))continue; if(IsReparsePointPath(full) && !CanOpenVarFile(full)){ try{ File.Delete(full); deleted++; }catch(Exception e){ errors++; DebugLog("CleanBrokenGeneratedLinks delete failed "+full+": "+e.Message); } } } if(deleted>0)RemoveEmptyDirs(linkRoot); if(deleted>0||errors>0)DebugLog("CleanBrokenGeneratedLinks deleted="+deleted+", errors="+errors); }catch(Exception e){ DebugLog("CleanBrokenGeneratedLinks failed: "+e.Message); } return deleted; }
+
+    private List<string> GetNonEssentialCacheDirectories() {
+        HashSet<string> paths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        paths.Add(thumbRoot);
+        paths.Add(Path.Combine(dataRoot, "timeline-cache"));
+        paths.Add(Path.Combine(dataRoot, "temp_presets"));
+        paths.Add(Path.Combine(vamRoot, "Custom\\Scripts\\_AllPackagesLinkerTemp"));
+        paths.Add(Path.Combine(vamRoot, "Saves\\scene\\_AllPackagesLinkerTempScenes"));
+        string[] presetTypes = new string[] { "Animation", "BreastPhysics", "Clothing", "Hair", "Morphs", "Plugins", "Pose", "Skin", "General", "Full", "Appearance" };
+        for (int i = 0; i < presetTypes.Length; i++) paths.Add(Path.Combine(GetLocalPresetStoreDir(presetTypes[i]), "_AllPackagesLinkerTemp"));
+        return new List<string>(paths);
+    }
+
+    private bool IsCachePathInsideVamRoot(string path) {
+        try {
+            string rootFull = Path.GetFullPath(vamRoot).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
+            string pathFull = Path.GetFullPath(path).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            return pathFull.StartsWith(rootFull, StringComparison.OrdinalIgnoreCase);
+        } catch { return false; }
+    }
+
+    private static void MeasureCachePath(string path, ref long bytes, ref int files, ref int errors) {
+        try {
+            if (File.Exists(path)) {
+                FileInfo file = new FileInfo(path);
+                if ((file.Attributes & FileAttributes.ReparsePoint) != 0) return;
+                bytes += Math.Max(0L, file.Length);
+                files++;
+                return;
+            }
+            if (!Directory.Exists(path)) return;
+            MeasureCacheDirectory(new DirectoryInfo(path), ref bytes, ref files, ref errors);
+        } catch { errors++; }
+    }
+
+    private static void MeasureCacheDirectory(DirectoryInfo directory, ref long bytes, ref int files, ref int errors) {
+        FileSystemInfo[] entries;
+        try { entries = directory.GetFileSystemInfos(); }
+        catch { errors++; return; }
+        for (int i = 0; i < entries.Length; i++) {
+            FileSystemInfo entry = entries[i];
+            try {
+                if ((entry.Attributes & FileAttributes.ReparsePoint) != 0) continue;
+                DirectoryInfo childDirectory = entry as DirectoryInfo;
+                if (childDirectory != null) MeasureCacheDirectory(childDirectory, ref bytes, ref files, ref errors);
+                else {
+                    FileInfo file = entry as FileInfo;
+                    if (file == null) continue;
+                    bytes += Math.Max(0L, file.Length);
+                    files++;
+                }
+            } catch { errors++; }
+        }
+    }
+
+    private CacheUsageSnapshot MeasureCacheUsage() {
+        CacheUsageSnapshot usage = new CacheUsageSnapshot();
+        List<string> nonEssential = GetNonEssentialCacheDirectories();
+        for (int i = 0; i < nonEssential.Count; i++) {
+            if (!IsCachePathInsideVamRoot(nonEssential[i])) { usage.errors++; continue; }
+            MeasureCachePath(nonEssential[i], ref usage.nonEssentialBytes, ref usage.nonEssentialFiles, ref usage.errors);
+        }
+        usage.allBytes = usage.nonEssentialBytes;
+        usage.allFiles = usage.nonEssentialFiles;
+        if (IsCachePathInsideVamRoot(indexPath)) MeasureCachePath(indexPath, ref usage.allBytes, ref usage.allFiles, ref usage.errors);
+        else usage.errors++;
+        string vamCache = Path.Combine(vamRoot, "Cache");
+        if (IsCachePathInsideVamRoot(vamCache)) MeasureCachePath(vamCache, ref usage.allBytes, ref usage.allFiles, ref usage.errors);
+        else usage.errors++;
+        return usage;
+    }
+
+    private static void DeleteCacheDirectoryContents(DirectoryInfo directory, CacheDeleteReport report) {
+        FileSystemInfo[] entries;
+        try { entries = directory.GetFileSystemInfos(); }
+        catch { report.errors++; return; }
+        for (int i = 0; i < entries.Length; i++) {
+            FileSystemInfo entry = entries[i];
+            try {
+                if ((entry.Attributes & FileAttributes.ReparsePoint) != 0) {
+                    DirectoryInfo linkedDirectory = entry as DirectoryInfo;
+                    if (linkedDirectory != null) Directory.Delete(linkedDirectory.FullName, false);
+                    else File.Delete(entry.FullName);
+                    report.deletedFiles++;
+                    continue;
+                }
+                DirectoryInfo childDirectory = entry as DirectoryInfo;
+                if (childDirectory != null) {
+                    DeleteCacheDirectoryContents(childDirectory, report);
+                    try { childDirectory.Delete(false); } catch { report.errors++; }
+                    continue;
+                }
+                FileInfo file = entry as FileInfo;
+                if (file == null) continue;
+                long length = 0L;
+                try { length = Math.Max(0L, file.Length); } catch {}
+                file.Delete();
+                report.deletedBytes += length;
+                report.deletedFiles++;
+            } catch { report.errors++; }
+        }
+    }
+
+    private void ClearCacheDirectory(string path, CacheDeleteReport report) {
+        if (!IsCachePathInsideVamRoot(path)) { report.errors++; return; }
+        try {
+            if (!Directory.Exists(path)) return;
+            DirectoryInfo directory = new DirectoryInfo(path);
+            if ((directory.Attributes & FileAttributes.ReparsePoint) != 0) { report.errors++; return; }
+            DeleteCacheDirectoryContents(directory, report);
+        } catch { report.errors++; }
+    }
+
+    private CacheDeleteReport ClearCacheFiles(bool allCaches) {
+        CacheDeleteReport report = new CacheDeleteReport();
+        List<string> directories = GetNonEssentialCacheDirectories();
+        if (allCaches) directories.Add(Path.Combine(vamRoot, "Cache"));
+        for (int i = 0; i < directories.Count; i++) ClearCacheDirectory(directories[i], report);
+        if (allCaches) {
+            try {
+                if (!IsCachePathInsideVamRoot(indexPath)) report.errors++;
+                else if (File.Exists(indexPath)) {
+                    long length = 0L;
+                    try { length = Math.Max(0L, new FileInfo(indexPath).Length); } catch {}
+                    File.Delete(indexPath);
+                    report.deletedBytes += length;
+                    report.deletedFiles++;
+                }
+            } catch { report.errors++; }
+        }
+        try { Directory.CreateDirectory(thumbRoot); } catch { report.errors++; }
+        return report;
+    }
+
+    private static string FormatCacheBytes(long bytes) {
+        double value = Math.Max(0L, bytes);
+        if (value >= 1024.0 * 1024.0 * 1024.0) return (value / (1024.0 * 1024.0 * 1024.0)).ToString("0.00", CultureInfo.InvariantCulture) + " GiB";
+        if (value >= 1024.0 * 1024.0) return (value / (1024.0 * 1024.0)).ToString("0.0", CultureInfo.InvariantCulture) + " MiB";
+        if (value >= 1024.0) return (value / 1024.0).ToString("0.0", CultureInfo.InvariantCulture) + " KiB";
+        return ((long)value).ToString(CultureInfo.InvariantCulture) + " B";
+    }
+
+    private void UpdateCacheUsageUi() {
+        if (cacheSizeText != null) {
+            if (lastCacheUsage == null) cacheSizeText.text = cacheWorkerRunning ? "缓存大小：统计中..." : "缓存大小：尚未统计";
+            else cacheSizeText.text = "非必要 " + FormatCacheBytes(lastCacheUsage.nonEssentialBytes) + "（" + lastCacheUsage.nonEssentialFiles + " 文件）  |  全部 " + FormatCacheBytes(lastCacheUsage.allBytes) + "（" + lastCacheUsage.allFiles + " 文件）";
+        }
+        if (clearNonEssentialCacheBtn != null) clearNonEssentialCacheBtn.interactable = !cacheWorkerRunning && lastCacheUsage != null;
+        if (clearAllCacheBtn != null) clearAllCacheBtn.interactable = !cacheWorkerRunning && lastCacheUsage != null;
+    }
+
+    private void StartCacheUsageScan() {
+        if (cacheWorkerRunning) return;
+        cacheWorkerRunning = true;
+        cacheWorkerResult = null;
+        UpdateCacheUsageUi();
+        Thread worker = new Thread(delegate() {
+            CacheWorkerResult result = new CacheWorkerResult();
+            result.operation = "scan";
+            try { result.usage = MeasureCacheUsage(); }
+            catch (Exception e) { result.error = e.Message; }
+            cacheWorkerResult = result;
+        });
+        worker.IsBackground = true;
+        worker.Name = "APL Cache Scan";
+        worker.Start();
+    }
+
+    private bool CacheClearBlockedBySceneLoad() {
+        SuperController sc = SuperController.singleton;
+        return sceneLoadProfileActive || !string.IsNullOrEmpty(pendingScenePath) || (sc != null && sc.isLoading);
+    }
+
+    private void StartCacheClear(bool allCaches) {
+        if (cacheWorkerRunning) { SetStatus("缓存任务正在运行，请稍候。", false); return; }
+        if (scanning) { SetStatus("资源库正在扫描，暂不能清理缓存。", true); return; }
+        if (CacheClearBlockedBySceneLoad()) { SetStatus("场景正在准备或加载，暂不能清理缓存。", true); return; }
+        HideClearConfirm();
+        StopThumbLoadCoroutine();
+        StopScenePrewarm(true);
+        CancelPendingSceneLoad();
+        ClearPendingDeferredScene();
+        ClearPreview();
+        ClearListThumbs();
+        cacheWorkerRunning = true;
+        cacheWorkerResult = null;
+        UpdateCacheUsageUi();
+        SetStatus(allCaches ? "正在后台清除全部缓存..." : "正在后台清除非必要缓存...", true);
+        Thread worker = new Thread(delegate() {
+            CacheWorkerResult result = new CacheWorkerResult();
+            result.operation = allCaches ? "clear-all" : "clear-non-essential";
+            try {
+                CacheDeleteReport report = ClearCacheFiles(allCaches);
+                result.deletedBytes = report.deletedBytes;
+                result.deletedFiles = report.deletedFiles;
+                result.deleteErrors = report.errors;
+                result.usage = MeasureCacheUsage();
+            } catch (Exception e) { result.error = e.Message; }
+            cacheWorkerResult = result;
+        });
+        worker.IsBackground = true;
+        worker.Name = allCaches ? "APL Clear All Cache" : "APL Clear Nonessential Cache";
+        worker.Start();
+    }
+
+    private void PollCacheWorkerResult() {
+        CacheWorkerResult result = cacheWorkerResult;
+        if (result == null) return;
+        cacheWorkerResult = null;
+        cacheWorkerRunning = false;
+        if (result.usage != null) lastCacheUsage = result.usage;
+        UpdateCacheUsageUi();
+        if (result.operation == "scan") {
+            if (!string.IsNullOrEmpty(result.error)) SetStatus("缓存大小统计失败：" + result.error, true);
+            return;
+        }
+        materializedScriptRoots.Clear();
+        if (!string.IsNullOrEmpty(result.error)) {
+            SetStatus("缓存清理失败：" + result.error, true);
+            return;
+        }
+        string label = result.operation == "clear-all" ? "全部缓存" : "非必要缓存";
+        string message = "已清除" + label + "：释放 " + FormatCacheBytes(result.deletedBytes) + "，删除 " + result.deletedFiles + " 个文件，失败 " + result.deleteErrors + " 个";
+        if (result.operation == "clear-all") message += "；建议重启 VaM 后继续使用";
+        SetStatus(message, true);
+        DebugLog("Cache clear complete. operation=" + result.operation + ", deletedBytes=" + result.deletedBytes + ", deletedFiles=" + result.deletedFiles + ", errors=" + result.deleteErrors);
+    }
+
+    private void ShowCacheClearConfirm(bool allCaches) {
+        try {
+            if (root == null || lastCacheUsage == null) return;
+            if (cacheWorkerRunning) { SetStatus("缓存任务正在运行，请稍候。", false); return; }
+            if (scanning) { SetStatus("资源库正在扫描，暂不能清理缓存。", true); return; }
+            if (CacheClearBlockedBySceneLoad()) { SetStatus("场景正在准备或加载，暂不能清理缓存。", true); return; }
+            if (confirmRoot != null) Destroy(confirmRoot);
+            long bytes = allCaches ? lastCacheUsage.allBytes : lastCacheUsage.nonEssentialBytes;
+            int files = allCaches ? lastCacheUsage.allFiles : lastCacheUsage.nonEssentialFiles;
+            confirmRoot = new GameObject(allCaches ? "确认清除全部缓存" : "确认清除非必要缓存");
+            confirmRoot.transform.SetParent(root.transform, false);
+            Image overlay = confirmRoot.AddComponent<Image>();
+            overlay.color = new Color(0f, 0f, 0f, 0.78f);
+            RectTransform oRt = overlay.rectTransform;
+            oRt.anchorMin = Vector2.zero; oRt.anchorMax = Vector2.one; oRt.offsetMin = Vector2.zero; oRt.offsetMax = Vector2.zero;
+            GameObject box = new GameObject("确认框");
+            box.transform.SetParent(confirmRoot.transform, false);
+            Image boxImg = box.AddComponent<Image>();
+            boxImg.color = colPanel;
+            RectTransform boxRt = box.GetComponent<RectTransform>();
+            boxRt.anchorMin = new Vector2(0.22f, 0.27f); boxRt.anchorMax = new Vector2(0.78f, 0.73f); boxRt.offsetMin = Vector2.zero; boxRt.offsetMax = Vector2.zero;
+            Text title = MakeText(box.transform, "标题", allCaches ? "确认清除全部缓存？" : "确认清除非必要缓存？", 23, TextAnchor.MiddleCenter, colTextPrimary);
+            RectTransform tRt = title.rectTransform;
+            tRt.anchorMin = new Vector2(0.05f, 0.76f); tRt.anchorMax = new Vector2(0.95f, 0.94f); tRt.offsetMin = Vector2.zero; tRt.offsetMax = Vector2.zero;
+            string scope = allCaches
+                ? "包含 APL 可重建缓存、资源索引和 VaM 纹理/PackageJSON 缓存。\n不会删除 VAR、场景源文件、预设、配置或收藏。\n清理后首次加载会明显变慢，建议完成后重启 VaM。"
+                : "包含 APL 缩略图、Timeline 派生文件及临时场景/脚本/预设。\n保留资源索引、VaM 纹理缓存、配置和收藏。\n相关内容会在下次使用时自动重建。";
+            Text msg = MakeText(box.transform, "说明", scope + "\n\n预计释放：" + FormatCacheBytes(bytes) + " | 文件：" + files, 15, TextAnchor.UpperCenter, colTextSecondary);
+            msg.horizontalOverflow = HorizontalWrapMode.Wrap;
+            msg.verticalOverflow = VerticalWrapMode.Overflow;
+            RectTransform mRt = msg.rectTransform;
+            mRt.anchorMin = new Vector2(0.08f, 0.31f); mRt.anchorMax = new Vector2(0.92f, 0.75f); mRt.offsetMin = Vector2.zero; mRt.offsetMax = Vector2.zero;
+            Button yes = MakeButton(box.transform, allCaches ? "确认全部清除" : "确认清除", 17, colDanger);
+            RectTransform yRt = yes.GetComponent<RectTransform>();
+            yRt.anchorMin = new Vector2(0.12f, 0.08f); yRt.anchorMax = new Vector2(0.45f, 0.25f); yRt.offsetMin = Vector2.zero; yRt.offsetMax = Vector2.zero;
+            yes.onClick.AddListener(() => StartCacheClear(allCaches));
+            Button no = MakeButton(box.transform, "取消", 17, colBtn);
+            RectTransform nRt = no.GetComponent<RectTransform>();
+            nRt.anchorMin = new Vector2(0.55f, 0.08f); nRt.anchorMax = new Vector2(0.88f, 0.25f); nRt.offsetMin = Vector2.zero; nRt.offsetMax = Vector2.zero;
+            no.onClick.AddListener(() => HideClearConfirm());
+        } catch (Exception e) { SetStatus("缓存确认框打开失败：" + e.Message, true); }
+    }
+
     private void ShowClearConfirm(){ try{ if(root==null)return; if(confirmRoot!=null)Destroy(confirmRoot); int deletable,skipped; CountGeneratedLinks(out deletable,out skipped); confirmRoot=new GameObject("确认删除软链接"); confirmRoot.transform.SetParent(root.transform,false); Image overlay=confirmRoot.AddComponent<Image>(); overlay.color=new Color(0f,0f,0f,0.75f); RectTransform oRt=overlay.rectTransform; oRt.anchorMin=Vector2.zero; oRt.anchorMax=Vector2.one; oRt.offsetMin=Vector2.zero; oRt.offsetMax=Vector2.zero; GameObject box=new GameObject("确认框"); box.transform.SetParent(confirmRoot.transform,false); Image boxImg=box.AddComponent<Image>(); boxImg.color=colPanel; RectTransform boxRt=box.GetComponent<RectTransform>(); boxRt.anchorMin=new Vector2(0.25f,0.30f); boxRt.anchorMax=new Vector2(0.75f,0.70f); boxRt.offsetMin=Vector2.zero; boxRt.offsetMax=Vector2.zero; Text title=MakeText(box.transform,"标题","确认清除插件生成的软链接？",24,TextAnchor.MiddleCenter,colTextPrimary); RectTransform tRt=title.rectTransform; tRt.anchorMin=new Vector2(0.05f,0.75f); tRt.anchorMax=new Vector2(0.95f,0.95f); tRt.offsetMin=Vector2.zero; tRt.offsetMax=Vector2.zero; Text msg=MakeText(box.transform,"说明","将只删除 _AllPackagesLinkerLinks 目录里的 .var 链接项。\n不会删除 Allpackages 中的真实包，也不会碰其他包。\n\n可删除："+deletable+" 个 | 默认保留跳过："+skipped+" 个",16,TextAnchor.UpperCenter,colTextSecondary); RectTransform mRt=msg.rectTransform; mRt.anchorMin=new Vector2(0.08f,0.35f); mRt.anchorMax=new Vector2(0.92f,0.74f); mRt.offsetMin=Vector2.zero; mRt.offsetMax=Vector2.zero; Button yes=MakeButton(box.transform,"确认删除",18,new Color(0.600f,0.200f,0.200f,0.95f)); RectTransform yRt=yes.GetComponent<RectTransform>(); yRt.anchorMin=new Vector2(0.12f,0.08f); yRt.anchorMax=new Vector2(0.45f,0.25f); yRt.offsetMin=Vector2.zero; yRt.offsetMax=Vector2.zero; yes.onClick.AddListener(()=>{HideClearConfirm();ClearLinks();RefreshList();}); Button no=MakeButton(box.transform,"取消",18,colBtn); RectTransform nRt=no.GetComponent<RectTransform>(); nRt.anchorMin=new Vector2(0.55f,0.08f); nRt.anchorMax=new Vector2(0.88f,0.25f); nRt.offsetMin=Vector2.zero; nRt.offsetMax=Vector2.zero; no.onClick.AddListener(()=>HideClearConfirm()); SetStatus("请确认是否删除插件生成的软链接。",false); }catch(Exception e){SetStatus("确认框打开失败："+e.Message,true);} }
     private void HideClearConfirm(){ try{ if(confirmRoot!=null)Destroy(confirmRoot); }catch{} confirmRoot=null; }
     private void CountGeneratedLinks(out int deletable,out int skippedDefault){ deletable=0; skippedDefault=0; try{ if(!Directory.Exists(linkRoot))return; string basePath=Path.GetFullPath(linkRoot).TrimEnd(Path.DirectorySeparatorChar,Path.AltDirectorySeparatorChar)+Path.DirectorySeparatorChar; string[] files=Directory.GetFiles(linkRoot,"*.var",SearchOption.AllDirectories); foreach(string f in files){ string full=Path.GetFullPath(f); if(!full.StartsWith(basePath,StringComparison.OrdinalIgnoreCase))continue; string uid=Path.GetFileNameWithoutExtension(f); if(defaultUids.Contains(uid))skippedDefault++; else deletable++; } }catch{} }
@@ -7319,8 +7612,28 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
             Button recenter = MakeButton(vrRow4.transform, "重新居中", 13, colAccentDim); SetFlexibleItem(recenter.gameObject, 0f, 1f); recenter.onClick.AddListener(() => RecenterVrCanvas());
         }
 
-        Text g4 = MakeText(content.transform, "G4", "维护（危险）", 15, TextAnchor.MiddleLeft, new Color(0.85f, 0.30f, 0.30f, 1f));
+        Text g4 = MakeText(content.transform, "G4", "缓存", 15, TextAnchor.MiddleLeft, colAccent);
         SetFixedHeight(g4.gameObject, 24f);
+        cacheSizeText = MakeText(content.transform, "CacheSize", "缓存大小：统计中...", 13, TextAnchor.MiddleLeft, colTextSecondary);
+        cacheSizeText.horizontalOverflow = HorizontalWrapMode.Wrap;
+        cacheSizeText.verticalOverflow = VerticalWrapMode.Overflow;
+        SetFixedHeight(cacheSizeText.gameObject, isVRMode ? 48f : 42f);
+        GameObject cacheRow = CreateRow(content.transform, "CacheActions", isVRMode ? 48f : 42f, 8, true);
+        clearNonEssentialCacheBtn = MakeButton(cacheRow.transform, "清除非必要", 14, colBtn);
+        SetFlexibleItem(clearNonEssentialCacheBtn.gameObject, 0f, 1f);
+        clearNonEssentialCacheBtn.onClick.AddListener(() => ShowCacheClearConfirm(false));
+        clearAllCacheBtn = MakeButton(cacheRow.transform, "清除全部", 14, colDanger);
+        SetFlexibleItem(clearAllCacheBtn.gameObject, 0f, 1f);
+        clearAllCacheBtn.onClick.AddListener(() => ShowCacheClearConfirm(true));
+        Text cacheHint = MakeText(content.transform, "CacheHint", "非必要：APL 缩略图、Timeline 派生和临时文件。全部：另含资源索引与 VaM 纹理缓存。配置、收藏、VAR 和场景源文件始终保留。", 12, TextAnchor.UpperLeft, colTextDim);
+        cacheHint.horizontalOverflow = HorizontalWrapMode.Wrap;
+        cacheHint.verticalOverflow = VerticalWrapMode.Overflow;
+        SetFixedHeight(cacheHint.gameObject, 58f);
+        UpdateCacheUsageUi();
+        if (lastCacheUsage == null && !cacheWorkerRunning) StartCacheUsageScan();
+
+        Text g5 = MakeText(content.transform, "G5", "维护（危险）", 15, TextAnchor.MiddleLeft, new Color(0.85f, 0.30f, 0.30f, 1f));
+        SetFixedHeight(g5.gameObject, 24f);
         dangerRowRoot = CreateRow(content.transform, "DangerRow", 42f, 8, true);
         Button clear = MakeButton(dangerRowRoot.transform, "清除生成链接", 14, colDanger);
         SetFlexibleItem(clear.gameObject, 0f, 1f);
