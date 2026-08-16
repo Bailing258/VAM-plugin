@@ -21,9 +21,9 @@ using MVR.FileManagement;
 using Valve.VR;
 using HarmonyLib;
 
-[BepInPlugin("local.vam.allpackageslinker", "AllPackagesLinker", "1.4.0")]
+[BepInPlugin("local.vam.allpackageslinker", "AllPackagesLinker", "1.4.1")]
 public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
-    private const string PluginVersion = "1.4.0";
+    private const string PluginVersion = "1.4.1";
     private const string TimelineConverterVersion = "timeline-optimized-v1";
     private const long MaxLargeSceneTextBytes = 1024L * 1024L * 1024L;
     private const string LinkRootName = "_AllPackagesLinkerLinks";
@@ -7155,8 +7155,6 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         }
         usage.allBytes = usage.nonEssentialBytes;
         usage.allFiles = usage.nonEssentialFiles;
-        if (IsCachePathInsideVamRoot(indexPath)) MeasureCachePath(indexPath, ref usage.allBytes, ref usage.allFiles, ref usage.errors);
-        else usage.errors++;
         string vamCache = Path.Combine(vamRoot, "Cache");
         if (IsCachePathInsideVamRoot(vamCache)) MeasureCachePath(vamCache, ref usage.allBytes, ref usage.allFiles, ref usage.errors);
         else usage.errors++;
@@ -7209,18 +7207,6 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         List<string> directories = GetNonEssentialCacheDirectories();
         if (allCaches) directories.Add(Path.Combine(vamRoot, "Cache"));
         for (int i = 0; i < directories.Count; i++) ClearCacheDirectory(directories[i], report);
-        if (allCaches) {
-            try {
-                if (!IsCachePathInsideVamRoot(indexPath)) report.errors++;
-                else if (File.Exists(indexPath)) {
-                    long length = 0L;
-                    try { length = Math.Max(0L, new FileInfo(indexPath).Length); } catch {}
-                    File.Delete(indexPath);
-                    report.deletedBytes += length;
-                    report.deletedFiles++;
-                }
-            } catch { report.errors++; }
-        }
         try { Directory.CreateDirectory(thumbRoot); } catch { report.errors++; }
         return report;
     }
@@ -7344,7 +7330,7 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
             RectTransform tRt = title.rectTransform;
             tRt.anchorMin = new Vector2(0.05f, 0.76f); tRt.anchorMax = new Vector2(0.95f, 0.94f); tRt.offsetMin = Vector2.zero; tRt.offsetMax = Vector2.zero;
             string scope = allCaches
-                ? "包含 APL 可重建缓存、资源索引和 VaM 纹理/PackageJSON 缓存。\n不会删除 VAR、场景源文件、预设、配置或收藏。\n清理后首次加载会明显变慢，建议完成后重启 VaM。"
+                ? "包含 APL 可重建缓存和 VaM 纹理/PackageJSON 缓存。\n保留资源索引，不会删除 VAR、场景源文件、预设、配置或收藏。\n清理后首次场景加载会明显变慢，建议完成后重启 VaM。"
                 : "包含 APL 缩略图、Timeline 派生文件及临时场景/脚本/预设。\n保留资源索引、VaM 纹理缓存、配置和收藏。\n相关内容会在下次使用时自动重建。";
             Text msg = MakeText(box.transform, "说明", scope + "\n\n预计释放：" + FormatCacheBytes(bytes) + " | 文件：" + files, 15, TextAnchor.UpperCenter, colTextSecondary);
             msg.horizontalOverflow = HorizontalWrapMode.Wrap;
@@ -7625,7 +7611,7 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         clearAllCacheBtn = MakeButton(cacheRow.transform, "清除全部", 14, colDanger);
         SetFlexibleItem(clearAllCacheBtn.gameObject, 0f, 1f);
         clearAllCacheBtn.onClick.AddListener(() => ShowCacheClearConfirm(true));
-        Text cacheHint = MakeText(content.transform, "CacheHint", "非必要：APL 缩略图、Timeline 派生和临时文件。全部：另含资源索引与 VaM 纹理缓存。配置、收藏、VAR 和场景源文件始终保留。", 12, TextAnchor.UpperLeft, colTextDim);
+        Text cacheHint = MakeText(content.transform, "CacheHint", "非必要：APL 缩略图、Timeline 派生和临时文件。全部：另含 VaM 纹理缓存。资源索引、配置、收藏、VAR 和场景源文件始终保留。", 12, TextAnchor.UpperLeft, colTextDim);
         cacheHint.horizontalOverflow = HorizontalWrapMode.Wrap;
         cacheHint.verticalOverflow = VerticalWrapMode.Overflow;
         SetFixedHeight(cacheHint.gameObject, 58f);
