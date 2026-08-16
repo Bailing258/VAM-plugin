@@ -20,9 +20,9 @@ using MVR.FileManagement;
 using Valve.VR;
 using HarmonyLib;
 
-[BepInPlugin("local.vam.allpackageslinker", "AllPackagesLinker", "1.3.8")]
+[BepInPlugin("local.vam.allpackageslinker", "AllPackagesLinker", "1.3.9")]
 public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
-    private const string PluginVersion = "1.3.8";
+    private const string PluginVersion = "1.3.9";
     private const string TimelineConverterVersion = "timeline-optimized-v1";
     private const long MaxLargeSceneTextBytes = 1024L * 1024L * 1024L;
     private const string LinkRootName = "_AllPackagesLinkerLinks";
@@ -39,6 +39,7 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
     private const float SceneLoadProfileTimeoutSeconds = 180.0f;
     private const string TextureFinishHarmonyId = "local.vam.allpackageslinker.texture-finish";
     private const string AssetCallbackHarmonyId = "local.vam.allpackageslinker.asset-callback";
+    private const string LazyCuaHarmonyId = "local.vam.allpackageslinker.lazy-cua";
     private const int TextureFinishVanillaLimit = 4;
     private const int SYMBOLIC_LINK_FLAG_FILE = 0x0;
     private const int SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE = 0x2;
@@ -258,6 +259,7 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
     private bool scanAllPackagesOnStartup = false;
     private bool autoCleanLinksBeforeSceneLoad = false;
     private bool sceneTexturePrewarmEnabled = true;
+    private bool lazyDisabledCuaEnabled = true;
     private int textureFinishGear = 1; // 0=vanilla 4, 1=balanced 8, 2=fast 12, 3=extreme 16
     private int assetCallbackGear = 2; // 0=ordered, 1=2/frame, 2=4/frame, 3=8/frame
     private Harmony textureFinishHarmony = null;
@@ -270,6 +272,16 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
     private static int assetWorkerTranspilerHits = 0;
     private static FieldInfo assetCompletionQueueField = null;
     private static FieldInfo assetRequestLoadCompletedField = null;
+    private Harmony lazyCuaHarmony = null;
+    private static AllPackagesLinkerBepInEx lazyCuaOwner = null;
+    private static bool lazyCuaPatchApplied = false;
+    private static MethodInfo lazyCuaSyncAssetUrlMethod = null;
+    private HashSet<string> lazyCuaCandidateAtomUids = new HashSet<string>(StringComparer.Ordinal);
+    private Dictionary<CustomUnityAssetLoader, string> deferredCuaUrls = new Dictionary<CustomUnityAssetLoader, string>();
+    private HashSet<CustomUnityAssetLoader> activatingDeferredCuaLoads = new HashSet<CustomUnityAssetLoader>();
+    private float nextDeferredCuaPollAt = 0f;
+    private int sceneLoadProfileDeferredCua = 0;
+    private int sceneLoadProfileActivatedDeferredCua = 0;
     private int sceneLoadProfileAssetCallbacks = 0;
     private int sceneLoadProfileOutOfOrderCallbacks = 0;
     private int sceneLoadProfileMaxCallbackScanAhead = 0;
@@ -367,6 +379,7 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
             LoadConfig();
             InstallTextureFinishPatch();
             InstallAssetCallbackPatch();
+            InstallLazyCuaPatch();
             configuredDownloadRoot = missingDepsDownloadRoot;
             string linkedDownloadRoot = ResolveLinkedLibraryDownloadRoot(missingDepsDownloadRoot);
             if (!string.Equals(linkedDownloadRoot, missingDepsDownloadRoot, StringComparison.OrdinalIgnoreCase)) {
@@ -425,6 +438,7 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
                 DebugLog("Heartbeat. t=" + Time.realtimeSinceStartup.ToString("0.0") + ", canvas=" + (canvas != null) + ", scanned=" + scanned + ", scanning=" + scanning + ", packages=" + all.Count + ", superController=" + (SuperController.singleton != null) + ", unity=" + PressedJoystickButtons() + ", steamvr=" + OneLine(lastSteamVRDiag, 160) + ", openvr=" + OneLine(lastOpenVRDiag, 160));
             }
             PollSceneLoadProfile(false);
+            PollDeferredCuaLoads();
             if (canvas != null && isVRMode && vrCanvasWaitingForPlacement && Time.realtimeSinceStartup >= nextVrPlacementRetryAt) {
                 nextVrPlacementRetryAt = Time.realtimeSinceStartup + 0.5f;
                 if (CanPlaceVrCanvas()) {
@@ -642,6 +656,10 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
 
     private void OnDestroy() {
         DebugLog("OnDestroy.");
+        lazyCuaCandidateAtomUids.Clear();
+        deferredCuaUrls.Clear();
+        activatingDeferredCuaLoads.Clear();
+        UninstallLazyCuaPatch();
         UninstallAssetCallbackPatch();
         UninstallTextureFinishPatch();
         missingDepsDownloadCancelRequested=true;
@@ -884,6 +902,136 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         string patchState = assetCallbackPatchApplied ? "已启用" : "补丁未生效，保持顺序";
         SetStatus("CUA 加载挡位：" + AssetCallbackGearName(assetCallbackGear)
             + " " + AssetWorkerCountForGear(assetCallbackGear) + " Worker / " + AssetCallbackBudgetForGear(assetCallbackGear) + " 回调每帧（" + patchState + "）", true);
+    }
+    private void InstallLazyCuaPatch() {
+        lazyCuaOwner = this;
+        lazyCuaPatchApplied = false;
+        try {
+            MethodInfo syncAssetUrl = AccessTools.Method(typeof(CustomUnityAssetLoader), "SyncAssetUrl");
+            MethodInfo syncOn = AccessTools.Method(typeof(Atom), "SyncOn");
+            MethodInfo syncAssetUrlPrefix = AccessTools.Method(typeof(AllPackagesLinkerBepInEx), "LazyCuaSyncAssetUrlPrefix");
+            MethodInfo syncOnPostfix = AccessTools.Method(typeof(AllPackagesLinkerBepInEx), "LazyCuaSyncOnPostfix");
+            if (object.ReferenceEquals(syncAssetUrl, null) || object.ReferenceEquals(syncOn, null)
+                || object.ReferenceEquals(syncAssetUrlPrefix, null) || object.ReferenceEquals(syncOnPostfix, null)) {
+                throw new MissingMemberException("CustomUnityAssetLoader.SyncAssetUrl or Atom.SyncOn members not found");
+            }
+            lazyCuaSyncAssetUrlMethod = syncAssetUrl;
+            lazyCuaHarmony = new Harmony(LazyCuaHarmonyId);
+            lazyCuaHarmony.Patch(syncAssetUrl, new HarmonyMethod(syncAssetUrlPrefix));
+            lazyCuaHarmony.Patch(syncOn, null, new HarmonyMethod(syncOnPostfix));
+            lazyCuaPatchApplied = true;
+            DebugLog("Lazy disabled CUA patch installed. enabled=" + lazyDisabledCuaEnabled);
+        } catch (Exception e) {
+            try { if (lazyCuaHarmony != null) lazyCuaHarmony.UnpatchAll(LazyCuaHarmonyId); } catch {}
+            lazyCuaHarmony = null;
+            lazyCuaPatchApplied = false;
+            lazyCuaSyncAssetUrlMethod = null;
+            Logger.LogWarning("Lazy disabled CUA loading disabled; original CUA behavior remains active: " + e.Message);
+            DebugLog("Lazy disabled CUA patch failed: " + e.ToString());
+        }
+    }
+    private void UninstallLazyCuaPatch() {
+        try { if (lazyCuaHarmony != null) lazyCuaHarmony.UnpatchAll(LazyCuaHarmonyId); }
+        catch (Exception e) { Logger.LogWarning("Lazy disabled CUA patch cleanup failed: " + e.Message); }
+        lazyCuaHarmony = null;
+        lazyCuaPatchApplied = false;
+        lazyCuaSyncAssetUrlMethod = null;
+        if (object.ReferenceEquals(lazyCuaOwner, this)) lazyCuaOwner = null;
+    }
+    private static bool LazyCuaSyncAssetUrlPrefix(CustomUnityAssetLoader __instance, string __0) {
+        AllPackagesLinkerBepInEx owner = lazyCuaOwner;
+        if (!lazyCuaPatchApplied || owner == null || !owner.lazyDisabledCuaEnabled || string.IsNullOrEmpty(__0)) return true;
+        if (owner.activatingDeferredCuaLoads.Contains(__instance)) return true;
+        SuperController sc = SuperController.singleton;
+        Atom atom = __instance == null ? null : __instance.containingAtom;
+        if (!owner.sceneLoadProfileActive || sc == null || !sc.isLoading || atom == null
+            || !owner.lazyCuaCandidateAtomUids.Contains(atom.uid)) return true;
+        owner.DeferCuaLoad(__instance, __0);
+        return false;
+    }
+    private static void LazyCuaSyncOnPostfix(Atom __instance, bool __0) {
+        AllPackagesLinkerBepInEx owner = lazyCuaOwner;
+        if (__0 && lazyCuaPatchApplied && owner != null && owner.lazyDisabledCuaEnabled) owner.ActivateDeferredCuaLoads(__instance, "atom-enabled");
+    }
+    private void DeferCuaLoad(CustomUnityAssetLoader loader, string path) {
+        if (loader == null || string.IsNullOrEmpty(path)) return;
+        bool added = !deferredCuaUrls.ContainsKey(loader);
+        deferredCuaUrls[loader] = path;
+        if (!added) return;
+        sceneLoadProfileDeferredCua++;
+        int count = deferredCuaUrls.Count;
+        if (count == 1 || count % 10 == 0) DebugLog("Lazy disabled CUA queued. pending=" + count);
+    }
+    private void PrepareLazyCuaCandidates(string sceneJson) {
+        lazyCuaCandidateAtomUids.Clear();
+        if (!lazyDisabledCuaEnabled || string.IsNullOrEmpty(sceneJson)) return;
+        try {
+            SceneJsonAnalysis analysis = new SceneJsonAnalysis();
+            string error;
+            if (!TryAnalyzeSceneAtoms(sceneJson, analysis, out error)) throw new InvalidDataException(error);
+            for (int i = 0; i < analysis.atoms.Count; i++) {
+                SceneAtomSpan atom = analysis.atoms[i];
+                if (!string.Equals(atom.type, "CustomUnityAsset", StringComparison.OrdinalIgnoreCase) || string.IsNullOrEmpty(atom.id)) continue;
+                string on;
+                if (TryFindDirectStringProperty(sceneJson, atom.start, atom.start + atom.length, "on", out on)
+                    && string.Equals(on, "false", StringComparison.OrdinalIgnoreCase)) lazyCuaCandidateAtomUids.Add(atom.id);
+            }
+            DebugLog("Lazy disabled CUA candidates prepared. count=" + lazyCuaCandidateAtomUids.Count);
+        } catch (Exception e) {
+            lazyCuaCandidateAtomUids.Clear();
+            DebugLog("Lazy disabled CUA candidate scan failed; original loading remains active: " + e.Message);
+        }
+    }
+    private void PollDeferredCuaLoads() {
+        if (deferredCuaUrls.Count == 0 || Time.realtimeSinceStartup < nextDeferredCuaPollAt) return;
+        nextDeferredCuaPollAt = Time.realtimeSinceStartup + 0.25f;
+        List<CustomUnityAssetLoader> loaders = new List<CustomUnityAssetLoader>(deferredCuaUrls.Keys);
+        for (int i = 0; i < loaders.Count; i++) {
+            CustomUnityAssetLoader loader = loaders[i];
+            if (loader == null || loader.containingAtom == null) {
+                deferredCuaUrls.Remove(loader);
+                continue;
+            }
+            if (loader.containingAtom.on) ActivateDeferredCuaLoad(loader, "poll-enabled");
+        }
+    }
+    private void ActivateDeferredCuaLoads(Atom atom, string reason) {
+        if (atom == null || deferredCuaUrls.Count == 0) return;
+        List<CustomUnityAssetLoader> loaders = new List<CustomUnityAssetLoader>(deferredCuaUrls.Keys);
+        for (int i = 0; i < loaders.Count; i++) {
+            CustomUnityAssetLoader loader = loaders[i];
+            if (loader != null && loader.containingAtom == atom) ActivateDeferredCuaLoad(loader, reason);
+        }
+    }
+    private void ActivateDeferredCuaLoad(CustomUnityAssetLoader loader, string reason) {
+        string path;
+        if (loader == null || !deferredCuaUrls.TryGetValue(loader, out path)) return;
+        deferredCuaUrls.Remove(loader);
+        activatingDeferredCuaLoads.Add(loader);
+        try {
+            if (object.ReferenceEquals(lazyCuaSyncAssetUrlMethod, null)) throw new MissingMethodException("CustomUnityAssetLoader.SyncAssetUrl");
+            lazyCuaSyncAssetUrlMethod.Invoke(loader, new object[] { path });
+            sceneLoadProfileActivatedDeferredCua++;
+            DebugLog("Lazy CUA activated. atom=" + SceneLoadProfileLogValue(loader.containingAtom == null ? "-" : loader.containingAtom.uid)
+                + ", reason=" + reason + ", remaining=" + deferredCuaUrls.Count);
+        } catch (Exception e) {
+            if (loader != null) deferredCuaUrls[loader] = path;
+            DebugLog("Lazy CUA activation failed. reason=" + reason + ", path=" + SceneLoadProfileLogValue(path) + ", error=" + e.ToString());
+        } finally {
+            activatingDeferredCuaLoads.Remove(loader);
+        }
+    }
+    private void FlushDeferredCuaLoads(string reason) {
+        if (deferredCuaUrls.Count == 0) return;
+        List<CustomUnityAssetLoader> loaders = new List<CustomUnityAssetLoader>(deferredCuaUrls.Keys);
+        for (int i = 0; i < loaders.Count; i++) ActivateDeferredCuaLoad(loaders[i], reason);
+    }
+    private void SetLazyDisabledCuaEnabled(bool enabled) {
+        lazyDisabledCuaEnabled = enabled;
+        SaveConfig();
+        if (!enabled) FlushDeferredCuaLoads("settings-off");
+        string patchState = lazyCuaPatchApplied ? "已启用" : "补丁未生效，保持原版";
+        SetStatus("关闭 CUA 延迟加载：" + (enabled ? "开" : "关") + "（" + patchState + "）", true);
     }
     private void StopActiveHubProcess() {
         Process p = activeHubProcess; activeHubProcess = null;
@@ -1968,6 +2116,7 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
                 if(k=="scanAllPackagesOnStartup") scanAllPackagesOnStartup=(v=="1" || v.Equals("true", StringComparison.OrdinalIgnoreCase));
                 if(k=="autoCleanLinksBeforeSceneLoad") autoCleanLinksBeforeSceneLoad=(v=="1" || v.Equals("true", StringComparison.OrdinalIgnoreCase));
                 if(k=="sceneTexturePrewarmEnabled") sceneTexturePrewarmEnabled=(v=="1" || v.Equals("true", StringComparison.OrdinalIgnoreCase));
+                if(k=="lazyDisabledCuaEnabled") lazyDisabledCuaEnabled=(v=="1" || v.Equals("true", StringComparison.OrdinalIgnoreCase));
                 if(k=="textureFinishGear" && int.TryParse(v,out iv)) textureFinishGear=Mathf.Clamp(iv,0,3);
                 if(k=="assetCallbackGear" && int.TryParse(v,out iv)) assetCallbackGear=Mathf.Clamp(iv,0,3);
                 if(k=="sceneLoadMode" && int.TryParse(v,out iv)) sceneLoadMode=Mathf.Clamp(iv,0,2);
@@ -2003,6 +2152,7 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
             sb.Append("scanAllPackagesOnStartup=").Append(scanAllPackagesOnStartup?"1":"0").Append('\n');
             sb.Append("autoCleanLinksBeforeSceneLoad=").Append(autoCleanLinksBeforeSceneLoad?"1":"0").Append('\n');
             sb.Append("sceneTexturePrewarmEnabled=").Append(sceneTexturePrewarmEnabled?"1":"0").Append('\n');
+            sb.Append("lazyDisabledCuaEnabled=").Append(lazyDisabledCuaEnabled?"1":"0").Append('\n');
             sb.Append("textureFinishGear=").Append(textureFinishGear).Append('\n');
             sb.Append("assetCallbackGear=").Append(assetCallbackGear).Append('\n');
             sb.Append("sceneLoadMode=").Append(sceneLoadMode).Append('\n');
@@ -6301,6 +6451,7 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
             lastLoadClickAt=Time.realtimeSinceStartup;
             if(p==null||scene==""){SetStatus("没有可加载的场景。",true);return;}
             CancelPendingSceneLoad();
+            lazyCuaCandidateAtomUids.Clear();
             string requestedSceneKey = SceneAnalysisKey(p, scene);
             DebugLog("LoadPackageScene begin. uid="+p.uid+", scene="+scene+", mode="+SceneLoadModeName(sceneLoadMode)+", primary="+scenePrimaryPersonId);
             selected=p;
@@ -6370,6 +6521,7 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
                         stepSw.Stop();
                         sceneVariantMs = stepSw.Elapsed.TotalMilliseconds;
                     }
+                    PrepareLazyCuaCandidates(preparedSceneJson);
                     try {
                         stepSw = Stopwatch.StartNew();
                         bool primaryScriptsChanged;
@@ -6547,6 +6699,8 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         sceneLoadProfileAssetCallbackWorkMs = 0.0;
         sceneLoadProfileSlowestAssetCallbackMs = 0.0;
         sceneLoadProfileSlowestAssetCallback = "";
+        sceneLoadProfileDeferredCua = 0;
+        sceneLoadProfileActivatedDeferredCua = 0;
         sceneLoadProfilePendingHolds.Clear();
         sceneLoadProfileHoldFirstSeen.Clear();
         sceneLoadProfileHoldLabels.Clear();
@@ -6756,6 +6910,9 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
             + ", lastChangeMs=" + SceneLoadProfileElapsedMs(sceneLoadProfileLastChangeAt).ToString("0")
             + ", lastAdded=" + (string.IsNullOrEmpty(sceneLoadProfileLastAdded) ? "-" : sceneLoadProfileLastAdded)
             + ", maxPendingHolds=" + sceneLoadProfileMaxPendingHolds
+            + ", deferredCua=" + sceneLoadProfileDeferredCua
+            + ", activatedDeferredCua=" + sceneLoadProfileActivatedDeferredCua
+            + ", remainingDeferredCua=" + deferredCuaUrls.Count
             + ", longestHoldMs=" + (sceneLoadProfileLongestHoldSeconds * 1000f).ToString("0")
             + ", longestHold=" + (string.IsNullOrEmpty(sceneLoadProfileLongestHold) ? "-" : sceneLoadProfileLongestHold)
             + ", lastCompletedHold=" + (string.IsNullOrEmpty(sceneLoadProfileLastCompletedHold) ? "-" : sceneLoadProfileLastCompletedHold)
@@ -7057,6 +7214,9 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
             if (v) StartSelectedScenePrewarm(); else StopScenePrewarm(true);
             SetStatus("场景皮肤预热：" + (v ? "开" : "关"), true);
         });
+        Toggle lazyCuaTg = MakeToggle(content.transform, "初始关闭的 CUA 按需加载", lazyDisabledCuaEnabled);
+        SetFixedHeight(lazyCuaTg.gameObject, isVRMode ? 44f : 38f);
+        lazyCuaTg.onValueChanged.AddListener((bool v) => { SetLazyDisabledCuaEnabled(v); });
 
         Text textureFinishTitle = MakeText(content.transform, "TextureFinishTitle", "纹理收尾（仅加载时）", 14, TextAnchor.MiddleLeft, colTextSecondary);
         SetFixedHeight(textureFinishTitle.gameObject, 24f);
