@@ -21,9 +21,9 @@ using MVR.FileManagement;
 using Valve.VR;
 using HarmonyLib;
 
-[BepInPlugin("local.vam.allpackageslinker", "AllPackagesLinker", "1.4.2")]
+[BepInPlugin("local.vam.allpackageslinker", "AllPackagesLinker", "1.4.4")]
 public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
-    private const string PluginVersion = "1.4.2";
+    private const string PluginVersion = "1.4.4";
     private const string TimelineConverterVersion = "timeline-optimized-v1";
     private const long MaxLargeSceneTextBytes = 1024L * 1024L * 1024L;
     private const string LinkRootName = "_AllPackagesLinkerLinks";
@@ -325,6 +325,7 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
     private List<ImageLoaderThreaded.QueuedImage> activePrewarmImages = new List<ImageLoaderThreaded.QueuedImage>();
     private string pendingDeferredScenePath = "";
     private int pendingDeferredAtomCount = 0;
+    private bool pendingDeferredSceneReady = false;
     private float scenePrewarmWaitUntil = 0f;
     private string missingDepsDownloadRoot = MissingDepsDownloadRootDefault;
     private string configuredDownloadRoot = MissingDepsDownloadRootDefault;
@@ -3735,7 +3736,7 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         sceneFullModeBtn = MakeButton(sceneModeRoot.transform, "完整", 13, colBtn);
         SetFlexibleItem(sceneFullModeBtn.gameObject, 0f, 1f);
         sceneFullModeBtn.onClick.AddListener(() => SetSceneLoadMode(0));
-        scenePrimaryModeBtn = MakeButton(sceneModeRoot.transform, "人物优先", 13, colBtn);
+        scenePrimaryModeBtn = MakeButton(sceneModeRoot.transform, "全人物", 13, colBtn);
         SetFlexibleItem(scenePrimaryModeBtn.gameObject, 0f, 1f);
         scenePrimaryModeBtn.onClick.AddListener(() => SetSceneLoadMode(1));
         sceneMinimalModeBtn = MakeButton(sceneModeRoot.transform, "极简人物", 13, colBtn);
@@ -3758,7 +3759,7 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
             if (selectedSceneItem != null) LoadPackageScene(selectedSceneItem.package, selectedSceneItem.entryPath);
             else LinkSelected(true);
         });
-        loadDeferredSceneBtn = MakeButton(sceneActionRoot.transform, "加载其余 Atom", isVRMode ? 15 : 14, colSuccess);
+        loadDeferredSceneBtn = MakeButton(sceneActionRoot.transform, "补充加载", isVRMode ? 15 : 14, colSuccess);
         SetFlexibleItem(loadDeferredSceneBtn.gameObject, 0f, 1f);
         loadDeferredSceneBtn.onClick.AddListener(() => LoadDeferredSceneAtoms());
         loadDeferredSceneBtn.gameObject.SetActive(false);
@@ -4729,7 +4730,7 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
     }
 
     private string SceneLoadModeName(int mode) {
-        if (mode == 1) return "人物优先";
+        if (mode == 1) return "全人物";
         if (mode == 2) return "极简人物";
         return "完整";
     }
@@ -5110,42 +5111,16 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         if (analysis == null || !string.IsNullOrEmpty(analysis.error) || analysis.atomsOpen < 0 || analysis.atomsClose < 0) { error = "场景结构尚未成功分析"; return false; }
         if (mode <= 0) { result.primaryJson = analysis.json; result.totalAtoms = result.keptAtoms = analysis.atoms.Count; return true; }
         SceneAtomSpan primary = null;
-        HashSet<string> knownIds = new HashSet<string>(StringComparer.Ordinal);
         for (int i = 0; i < analysis.atoms.Count; i++) {
-            if (!string.IsNullOrEmpty(analysis.atoms[i].id)) knownIds.Add(analysis.atoms[i].id);
             if (string.Equals(analysis.atoms[i].type, "Person", StringComparison.OrdinalIgnoreCase) && string.Equals(analysis.atoms[i].id, primaryPersonId, StringComparison.Ordinal)) primary = analysis.atoms[i];
         }
         if (primary == null) { error = "没有找到主角 Person：" + primaryPersonId; return false; }
-        HashSet<string> related = new HashSet<string>(StringComparer.Ordinal);
-        if (mode == 1) {
-            for (int i = 0; i < analysis.atoms.Count; i++) {
-                SceneAtomSpan atom = analysis.atoms[i];
-                if (!string.Equals(atom.type, "Person", StringComparison.OrdinalIgnoreCase) || string.IsNullOrEmpty(atom.id)) continue;
-                related.Add(atom.id);
-                related.UnionWith(FindAtomReferences(analysis.json, atom, knownIds));
-            }
-            bool changed = true;
-            while (changed) {
-                changed = false;
-                for (int i = 0; i < analysis.atoms.Count; i++) {
-                    SceneAtomSpan atom = analysis.atoms[i];
-                    if (related.Contains(atom.id)) continue;
-                    List<string> parents = FindJsonStringPropertyValues(analysis.json, atom.start, atom.start + atom.length, "parentAtom");
-                    for (int p = 0; p < parents.Count; p++) {
-                        if (related.Contains(parents[p])) { related.Add(atom.id); changed = true; break; }
-                    }
-                }
-            }
-        } else {
-            related.UnionWith(FindAtomReferences(analysis.json, primary, knownIds));
-            related.Add(primaryPersonId);
-        }
         List<SceneAtomSpan> kept = new List<SceneAtomSpan>();
         List<SceneAtomSpan> deferred = new List<SceneAtomSpan>();
         Dictionary<string,int> deferredTypeCounts = new Dictionary<string,int>(StringComparer.OrdinalIgnoreCase);
         for (int i = 0; i < analysis.atoms.Count; i++) {
             SceneAtomSpan atom = analysis.atoms[i];
-            bool keep = ShouldKeepSceneAtom(atom, mode, primaryPersonId, related);
+            bool keep = ShouldKeepSceneAtom(atom, mode, primaryPersonId);
             if (keep) kept.Add(atom);
             else {
                 deferred.Add(atom);
@@ -5164,13 +5139,12 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         return true;
     }
 
-    private static bool ShouldKeepSceneAtom(SceneAtomSpan atom, int mode, string primaryPersonId, HashSet<string> related) {
+    private static bool ShouldKeepSceneAtom(SceneAtomSpan atom, int mode, string primaryPersonId) {
         string type = atom.type ?? "";
         if (string.Equals(type, "Person", StringComparison.OrdinalIgnoreCase)) return mode == 1 || string.Equals(atom.id, primaryPersonId, StringComparison.Ordinal);
-        if (IsSystemSceneAtomType(type) || IsLightSceneAtomType(type)) return true;
-        if (mode >= 2) return false;
-        if (related.Contains(atom.id)) return true;
-        return !IsHeavyOptionalSceneAtomType(type);
+        if (IsSystemSceneAtomType(type)) return true;
+        if (mode == 1) return IsLightSceneAtomType(type) || IsFunctionalSceneAtomType(type);
+        return IsLightSceneAtomType(type);
     }
 
     private static bool IsSystemSceneAtomType(string type) {
@@ -5182,6 +5156,13 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
 
     private static bool IsLightSceneAtomType(string type) {
         return !string.IsNullOrEmpty(type) && type.EndsWith("Light", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsFunctionalSceneAtomType(string type) {
+        if (string.IsNullOrEmpty(type)) return false;
+        return type.IndexOf("Button", StringComparison.OrdinalIgnoreCase) >= 0
+            || type.IndexOf("Text", StringComparison.OrdinalIgnoreCase) >= 0
+            || type.IndexOf("Panel", StringComparison.OrdinalIgnoreCase) >= 0;
     }
 
     private static bool IsHeavyOptionalSceneAtomType(string type) {
@@ -6247,7 +6228,7 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
     }
 
     private void PatchLoadedPackageScriptPluginUrls() {
-        int atomCount = 0, slotCount = 0, packageRefs = 0, patched = 0, errors = 0;
+        int atomCount = 0, slotCount = 0, packageRefs = 0, patched = 0, loadedSkipped = 0, errors = 0;
         try {
             if (SuperController.singleton == null) return;
             List<Atom> atoms = SuperController.singleton.GetAtoms();
@@ -6269,6 +6250,13 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
                     if (!TryParsePackageScriptUrl(url, out uid, out entry)) continue;
                     packageRefs++;
                     try {
+                        // A populated controller list proves VaM already resolved and loaded
+                        // this package URL. Reloading it here is both unnecessary and very
+                        // expensive (several seconds per AudioSource on large scenes).
+                        if (plugin != null && plugin.scriptControllers != null && plugin.scriptControllers.Count > 0) {
+                            loadedSkipped++;
+                            continue;
+                        }
                         PackageLite p;
                         string source;
                         if (!TryResolvePackageByUid(uid, out p, out source) || p == null) {
@@ -6286,7 +6274,7 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
                     }
                 }
             }
-            DebugLog("PatchLoadedPackageScriptPluginUrls end. atoms=" + atomCount + ", slots=" + slotCount + ", packageRefs=" + packageRefs + ", patched=" + patched + ", errors=" + errors);
+            DebugLog("PatchLoadedPackageScriptPluginUrls end. atoms=" + atomCount + ", slots=" + slotCount + ", packageRefs=" + packageRefs + ", loadedSkipped=" + loadedSkipped + ", patched=" + patched + ", errors=" + errors);
         } catch (Exception e) {
             DebugLog("PatchLoadedPackageScriptPluginUrls FAILED: " + e.ToString());
         }
@@ -6626,7 +6614,7 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
                             DebugLog("Scene variant built: mode=" + SceneLoadModeName(sceneLoadMode) + ", primary=" + scenePrimaryPersonId + ", total=" + builtVariant.totalAtoms + ", kept=" + builtVariant.keptAtoms + ", deferred=" + builtVariant.deferredAtoms + ", deferredTypes=" + string.Join(",", builtVariant.deferredTypes.ToArray()));
                         } else {
                             DebugLog("Scene variant fallback to full: " + variantError);
-                            SetStatus("人物优先分析失败，已回退完整加载：" + variantError, true);
+                            SetStatus("精简场景分析失败，已回退完整加载：" + variantError, true);
                         }
                         stepSw.Stop();
                         sceneVariantMs = stepSw.Elapsed.TotalMilliseconds;
@@ -6654,6 +6642,7 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
                             if (string.IsNullOrEmpty(deferredPath)) deferredPath = WritePreparedSceneTemp(p, scene, sceneVariant.deferredJson, "deferred");
                             pendingDeferredScenePath = deferredPath;
                             pendingDeferredAtomCount = sceneVariant.deferredAtoms;
+                            pendingDeferredSceneReady = false;
                         }
                     } catch(Exception locEx) {
                         sceneLoadPath = SceneRef(p, scene);
@@ -6692,7 +6681,10 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
             DebugLog("LoadPackageScene prep timings: autoDeleted="+autoDeleted+", rootDepsMs="+rootDepsSw.Elapsed.TotalMilliseconds.ToString("0")+", sceneReadMs="+sceneReadMs.ToString("0")+", timelineCacheHit="+timelineInfo.cacheHit+", timelineOptimized="+timelineInfo.optimized+", timelineReadMs="+timelineInfo.readMs.ToString("0")+", timelineOptimizeMs="+timelineInfo.optimizeMs.ToString("0")+", timelineCacheReadMs="+timelineInfo.cacheReadMs.ToString("0")+", timelineSourceBytes="+timelineInfo.sourceBytes+", timelineOutputBytes="+timelineInfo.outputBytes+", timelineAnimations="+timelineInfo.animations+", timelineCurves="+timelineInfo.curves+", timelineKeys="+timelineInfo.keyframes+", sceneRefsMs="+sceneRefsMs.ToString("0")+", sceneVariantMs="+sceneVariantMs.ToString("0")+", localizeMs="+localizeMs.ToString("0")+", linkMs="+linkSw.Elapsed.TotalMilliseconds.ToString("0")+", refreshMs="+refreshMs.ToString("0")+", totalMs="+totalSw.Elapsed.TotalMilliseconds.ToString("0")+", created="+result.created+", already="+result.already+", missing="+result.missing.Count+", errors="+result.errors.Count+", localizedScripts="+localizedScripts+", localizedScriptsChanged="+localizedScriptsChanged+", localizationErrors="+localizationErrors.Count+", mode="+SceneLoadModeName(sceneLoadMode)+", primary="+scenePrimaryPersonId+", deferred="+pendingDeferredAtomCount+", sceneLoadPath="+sceneLoadPath);
             int expectedAtoms = sceneVariant != null ? sceneVariant.keptAtoms
                 : (selectedSceneAnalysis != null && string.Equals(selectedSceneAnalysis.key, requestedSceneKey, StringComparison.OrdinalIgnoreCase) ? selectedSceneAnalysis.atoms.Count : 0);
-            if(result.errors.Count==0 && SuperController.singleton!=null) ScheduleSceneLoad(sceneLoadPath, expectedAtoms);
+            if(result.errors.Count==0 && SuperController.singleton!=null) {
+                ScheduleSceneLoad(sceneLoadPath, expectedAtoms);
+                if(canvas!=null) UpdateInspectorVisibility();
+            }
             else {
                 ClearPendingDeferredScene();
                 if (SuperController.singleton == null) SetStatus("加载场景失败：SuperController 为空 | " + sceneRef, true);
@@ -6724,7 +6716,7 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         pendingScenePath="";
         pendingSceneExpectedAtomCount=0;
     }
-    private void ClearPendingDeferredScene(){ pendingDeferredScenePath=""; pendingDeferredAtomCount=0; }
+    private void ClearPendingDeferredScene(){ pendingDeferredScenePath=""; pendingDeferredAtomCount=0; pendingDeferredSceneReady=false; }
     private void ScheduleSceneLoad(string scenePath, int expectedAtoms){
         CancelPendingSceneLoad();
         pendingScenePath=scenePath;
@@ -7040,24 +7032,32 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         sceneLoadProfilePendingHolds.Clear();
         sceneLoadProfileHoldFirstSeen.Clear();
         sceneLoadProfileHoldLabels.Clear();
+        bool loadSucceeded = string.Equals(reason, "loading-finished", StringComparison.Ordinal)
+            || string.Equals(reason, "expected-atoms-stable", StringComparison.Ordinal);
+        if (loadSucceeded && !string.IsNullOrEmpty(pendingDeferredScenePath) && pendingDeferredAtomCount > 0) {
+            pendingDeferredSceneReady = true;
+            DebugLog("Deferred scene merge ready: path=" + pendingDeferredScenePath + ", atoms=" + pendingDeferredAtomCount);
+        }
+        if (canvas != null) UpdateInspectorVisibility();
     }
     private void LoadDeferredSceneAtoms(){
         string path=pendingDeferredScenePath;
         int count=pendingDeferredAtomCount;
         if(string.IsNullOrEmpty(path)||count<=0){SetStatus("没有等待加载的其余 Atom。",false);return;}
+        if(!pendingDeferredSceneReady){SetStatus("主场景仍在加载，请完成后再补充加载。",false);return;}
         try{
             if(SuperController.singleton==null){SetStatus("加载其余 Atom 失败：SuperController 为空。",true);return;}
             DebugLog("Calling SuperController.LoadMerge: "+path+", atoms="+count);
-            pendingDeferredScenePath=""; pendingDeferredAtomCount=0;
+            ClearPendingDeferredScene();
             UpdateInspectorVisibility();
             SuperController.singleton.LoadMerge(path);
-            SetStatus("正在合并加载其余 "+count+" 个 Atom...",true);
+            SetStatus("正在补充加载 "+count+" 个 Atom；当前人物不会重新加载。",true);
             CancelInvoke("PatchLoadedPackageScriptPluginUrls");
             Invoke("PatchLoadedPackageScriptPluginUrls",3.0f);
             Invoke("PatchLoadedPackageScriptPluginUrls",6.0f);
             Invoke("PatchLoadedPackageScriptPluginUrls",10.0f);
         }catch(Exception e){
-            pendingDeferredScenePath=path; pendingDeferredAtomCount=count;
+            pendingDeferredScenePath=path; pendingDeferredAtomCount=count; pendingDeferredSceneReady=true;
             DebugLog("LoadDeferredSceneAtoms FAILED: "+e.ToString());
             SetStatus("加载其余 Atom 失败："+e.Message,true);
             UpdateInspectorVisibility();
@@ -7843,7 +7843,14 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
             loadSceneBtn.interactable = canLoadScene;
             loadSceneBtn.gameObject.SetActive(canLoadScene);
         }
-        if (loadDeferredSceneBtn != null) loadDeferredSceneBtn.gameObject.SetActive(hasDeferredScene);
+        if (loadDeferredSceneBtn != null) {
+            loadDeferredSceneBtn.gameObject.SetActive(hasDeferredScene);
+            loadDeferredSceneBtn.interactable = hasDeferredScene && pendingDeferredSceneReady;
+            Text deferredLabel = loadDeferredSceneBtn.GetComponentInChildren<Text>();
+            if (deferredLabel != null) deferredLabel.text = pendingDeferredSceneReady
+                ? "补充加载 " + pendingDeferredAtomCount + " 个 Atom"
+                : "等待主场景加载...";
+        }
         UpdateSceneLoadModeUI();
         if (applyPresetBtn != null) applyPresetBtn.interactable = isPreset;
         if (loadScriptBtn != null) loadScriptBtn.interactable = isScript;
