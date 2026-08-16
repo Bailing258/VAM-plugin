@@ -21,9 +21,9 @@ using MVR.FileManagement;
 using Valve.VR;
 using HarmonyLib;
 
-[BepInPlugin("local.vam.allpackageslinker", "AllPackagesLinker", "1.4.1")]
+[BepInPlugin("local.vam.allpackageslinker", "AllPackagesLinker", "1.4.2")]
 public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
-    private const string PluginVersion = "1.4.1";
+    private const string PluginVersion = "1.4.2";
     private const string TimelineConverterVersion = "timeline-optimized-v1";
     private const long MaxLargeSceneTextBytes = 1024L * 1024L * 1024L;
     private const string LinkRootName = "_AllPackagesLinkerLinks";
@@ -41,6 +41,7 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
     private const string TextureFinishHarmonyId = "local.vam.allpackageslinker.texture-finish";
     private const string AssetCallbackHarmonyId = "local.vam.allpackageslinker.asset-callback";
     private const string LazyCuaHarmonyId = "local.vam.allpackageslinker.lazy-cua";
+    private const string VaMLoadPerfHarmonyId = "local.vam.allpackageslinker.vam-load-perf";
     private const int TextureFinishVanillaLimit = 4;
     private const int SYMBOLIC_LINK_FLAG_FILE = 0x0;
     private const int SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE = 0x2;
@@ -297,6 +298,9 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
     private static AllPackagesLinkerBepInEx lazyCuaOwner = null;
     private static bool lazyCuaPatchApplied = false;
     private static MethodInfo lazyCuaSyncAssetUrlMethod = null;
+    private Harmony vamLoadPerfHarmony = null;
+    private static AllPackagesLinkerBepInEx vamLoadPerfOwner = null;
+    private static int vamLoadPerfTranspilerHits = 0;
     private HashSet<string> lazyCuaCandidateAtomUids = new HashSet<string>(StringComparer.Ordinal);
     private Dictionary<CustomUnityAssetLoader, string> deferredCuaUrls = new Dictionary<CustomUnityAssetLoader, string>();
     private HashSet<CustomUnityAssetLoader> activatingDeferredCuaLoads = new HashSet<CustomUnityAssetLoader>();
@@ -401,6 +405,7 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
             InstallTextureFinishPatch();
             InstallAssetCallbackPatch();
             InstallLazyCuaPatch();
+            InstallVaMLoadPerfBridge();
             configuredDownloadRoot = missingDepsDownloadRoot;
             string linkedDownloadRoot = ResolveLinkedLibraryDownloadRoot(missingDepsDownloadRoot);
             if (!string.Equals(linkedDownloadRoot, missingDepsDownloadRoot, StringComparison.OrdinalIgnoreCase)) {
@@ -681,6 +686,7 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         lazyCuaCandidateAtomUids.Clear();
         deferredCuaUrls.Clear();
         activatingDeferredCuaLoads.Clear();
+        UninstallVaMLoadPerfBridge();
         UninstallLazyCuaPatch();
         UninstallAssetCallbackPatch();
         UninstallTextureFinishPatch();
@@ -693,6 +699,88 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         CancelInvoke("TryDispatchSceneLoadAfterPrewarm");
         ExitVrRotationMode("destroy");
         ClosePanel();
+    }
+
+    private void InstallVaMLoadPerfBridge() {
+        vamLoadPerfOwner = this;
+        vamLoadPerfTranspilerHits = 0;
+        try {
+            MethodInfo target = FindVaMLoadCoMoveNext();
+            MethodInfo transpiler = AccessTools.Method(typeof(AllPackagesLinkerBepInEx), "VaMLoadPerfTranspiler");
+            if (object.ReferenceEquals(target, null) || object.ReferenceEquals(transpiler, null)) throw new MissingMethodException("SuperController.LoadCo MoveNext or bridge transpiler not found");
+            vamLoadPerfHarmony = new Harmony(VaMLoadPerfHarmonyId);
+            vamLoadPerfHarmony.Patch(target, null, null, new HarmonyMethod(transpiler));
+            if (vamLoadPerfTranspilerHits == 0) throw new InvalidOperationException("VaM LoadCo contains no PerfLog calls; runtime core is not instrumented");
+            string coreVersion = "unknown";
+            try {
+                FieldInfo versionField = typeof(SuperController).GetField("LOADPERF_VERSION", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+                if (!object.ReferenceEquals(versionField, null)) coreVersion = Convert.ToString(versionField.GetRawConstantValue(), CultureInfo.InvariantCulture);
+            } catch {}
+            DebugLog("VaM LoadPerf bridge installed. coreVersion=" + coreVersion + ", callSites=" + vamLoadPerfTranspilerHits);
+        } catch (Exception e) {
+            try { if (vamLoadPerfHarmony != null) vamLoadPerfHarmony.UnpatchAll(VaMLoadPerfHarmonyId); } catch {}
+            vamLoadPerfHarmony = null;
+            if (object.ReferenceEquals(vamLoadPerfOwner, this)) vamLoadPerfOwner = null;
+            Logger.LogWarning("VaM phase profiling unavailable; loading behavior is unchanged: " + e.Message);
+            DebugLog("VaM LoadPerf bridge failed: " + e.ToString());
+        }
+    }
+
+    private void UninstallVaMLoadPerfBridge() {
+        try { if (vamLoadPerfHarmony != null) vamLoadPerfHarmony.UnpatchAll(VaMLoadPerfHarmonyId); }
+        catch (Exception e) { Logger.LogWarning("VaM LoadPerf bridge cleanup failed: " + e.Message); }
+        vamLoadPerfHarmony = null;
+        vamLoadPerfTranspilerHits = 0;
+        if (object.ReferenceEquals(vamLoadPerfOwner, this)) vamLoadPerfOwner = null;
+    }
+
+    private static MethodInfo FindVaMLoadCoMoveNext() {
+        Type[] nested = typeof(SuperController).GetNestedTypes(BindingFlags.Public | BindingFlags.NonPublic);
+        for (int i = 0; i < nested.Length; i++) {
+            Type type = nested[i];
+            if (object.ReferenceEquals(type, null) || !type.Name.StartsWith("<LoadCo>", StringComparison.Ordinal)) continue;
+            MethodInfo moveNext = type.GetMethod("MoveNext", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            if (!object.ReferenceEquals(moveNext, null)) return moveNext;
+        }
+        return null;
+    }
+
+    private static IEnumerable<CodeInstruction> VaMLoadPerfTranspiler(IEnumerable<CodeInstruction> instructions) {
+        List<CodeInstruction> codes = new List<CodeInstruction>(instructions);
+        MethodInfo perfLog = typeof(SuperController).GetMethod("PerfLog", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic, null, new Type[] { typeof(string) }, null);
+        MethodInfo capture = AccessTools.Method(typeof(AllPackagesLinkerBepInEx), "CaptureVaMLoadPerf");
+        int hits = 0;
+        if (!object.ReferenceEquals(perfLog, null) && !object.ReferenceEquals(capture, null)) {
+            for (int i = 0; i < codes.Count; i++) {
+                MethodInfo called = codes[i].operand as MethodInfo;
+                if ((codes[i].opcode == OpCodes.Call || codes[i].opcode == OpCodes.Callvirt) && object.Equals(called, perfLog)) {
+                    codes[i].opcode = OpCodes.Call;
+                    codes[i].operand = capture;
+                    hits++;
+                }
+            }
+        }
+        vamLoadPerfTranspilerHits = hits;
+        return codes;
+    }
+
+    private static void CaptureVaMLoadPerf(string message) {
+        AllPackagesLinkerBepInEx owner = vamLoadPerfOwner;
+        if (owner == null || !owner.sceneLoadProfileActive || !IsVaMLoadPerfSummary(message)) return;
+        owner.DebugLog("[VaMLoadPerf] " + message);
+    }
+
+    private static bool IsVaMLoadPerfSummary(string message) {
+        if (string.IsNullOrEmpty(message) || !message.StartsWith("[LoadPerf]", StringComparison.Ordinal)) return false;
+        if (message.StartsWith("[LoadPerf]   [Person恢复]", StringComparison.Ordinal)
+            || message.StartsWith("[LoadPerf]   Atom恢复 #", StringComparison.Ordinal)
+            || message.StartsWith("[LoadPerf]   LateRestore #", StringComparison.Ordinal)
+            || message.StartsWith("[LoadPerf]   AB预加载:", StringComparison.Ordinal)
+            || message.StartsWith("[LoadPerf] P16:   Person", StringComparison.Ordinal)
+            || message.StartsWith("[LoadPerf] P17:   启动Person", StringComparison.Ordinal)
+            || message.StartsWith("[LoadPerf] P11-CheckHoldLoad首次进入:", StringComparison.Ordinal)
+            || message.StartsWith("[LoadPerf] P10-CheckHoldLoad诊断:", StringComparison.Ordinal)) return false;
+        return true;
     }
 
     private void InstallTextureFinishPatch() {
