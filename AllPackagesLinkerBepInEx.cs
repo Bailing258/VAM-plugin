@@ -21,9 +21,9 @@ using MVR.FileManagement;
 using Valve.VR;
 using HarmonyLib;
 
-[BepInPlugin("local.vam.allpackageslinker", "AllPackagesLinker", "1.4.6")]
+[BepInPlugin("local.vam.allpackageslinker", "AllPackagesLinker", "1.4.7")]
 public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
-    private const string PluginVersion = "1.4.6";
+    private const string PluginVersion = "1.4.7";
     private const string TimelineConverterVersion = "timeline-optimized-v1";
     private const long MaxLargeSceneTextBytes = 1024L * 1024L * 1024L;
     private const string LinkRootName = "_AllPackagesLinkerLinks";
@@ -103,7 +103,7 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
 
     private class SceneAtomSpan {
         public int start, length;
-        public string id="", type="";
+        public string id="", type="", character="", gender="Unknown";
     }
 
     private class SceneJsonAnalysis {
@@ -111,6 +111,16 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         public int atomsOpen=-1, atomsClose=-1;
         public List<SceneAtomSpan> atoms = new List<SceneAtomSpan>();
         public List<string> personIds = new List<string>();
+        public List<string> femalePersonIds = new List<string>();
+    }
+
+    private class SceneAppearanceChoice {
+        public string key="", label="", json="", source="", packageUid="";
+    }
+
+    private class SceneAtomReplacement {
+        public int start, length;
+        public string text="";
     }
 
     private class SceneVariantResult {
@@ -208,7 +218,7 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
     private InputField authorDropdownSearchInput;
     // UI refactor refs (plan.md)
     private GameObject navRoot, settingsDrawerRoot, settingsBackdropRoot, emptyStateRoot;
-    private GameObject atomRowRoot, presetOptionsRoot, presetModeRoot, presetActionRoot, sceneModeRoot, scenePersonRoot, sceneActionRoot, linkActionRoot, hubRowRoot, hubDownloadRoot, progressSectionRoot, dangerRowRoot, moreActionsRoot;
+    private GameObject atomRowRoot, presetOptionsRoot, presetModeRoot, presetActionRoot, sceneModeRoot, scenePersonRoot, sceneAppearanceRoot, sceneActionRoot, linkActionRoot, hubRowRoot, hubDownloadRoot, progressSectionRoot, dangerRowRoot, moreActionsRoot;
     private Text resultCountText, pageInfoText, searchPlaceholderText, cacheSizeText;
     private Button settingsBtn, rescanTopBtn, searchClearBtn, clearNonEssentialCacheBtn, clearAllCacheBtn;
     private Button loadSceneBtn, loadDeferredSceneBtn, sceneFullModeBtn, scenePrimaryModeBtn, sceneMinimalModeBtn, applyPresetBtn, loadScriptBtn, linkOnlyBtn, defaultKeepBtn, favToggleBtn;
@@ -274,13 +284,13 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
     private int pendingPluginPanelRetryCount = 0;
     private const int MaxPendingPluginPanelRetries = 30;
     private bool autoAllowAllPlugins = false;
-    // VR look mode (Left Stick Click toggle): stick X = yaw, stick Y = height
+    // VR look mode (Left Stick Click toggle): stick X = yaw, stick Y = pitch
     private bool vrRotationEnabled = true;
     private float vrRotationSensitivity = 60f;
-    private float vrHeightSpeed = 0.90f; // meters/sec when stick fully pushed
+    private float vrPitchSensitivity = 60f;
     private float vrRotationDeadzone = 0.18f;
     private bool vrRotationInvert = false;
-    private bool vrHeightInvert = false;
+    private bool vrPitchInvert = false;
     private float vrRotationSnapAngle = 0f;
     private float vrRotationSmoothing = 0.10f;
     private bool scanAllPackagesOnStartup = false;
@@ -327,6 +337,9 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
     private int sceneLoadMode = 0; // 0=full, 1=primary, 2=minimal
     private string scenePrimaryPersonId = "";
     private SceneJsonAnalysis selectedSceneAnalysis = null;
+    private List<SceneAppearanceChoice> sceneAppearanceChoices = new List<SceneAppearanceChoice>();
+    private Dictionary<string, string> sceneAppearanceSelections = new Dictionary<string, string>(StringComparer.Ordinal);
+    private Dictionary<string, Text> sceneAppearanceChoiceLabels = new Dictionary<string, Text>(StringComparer.Ordinal);
     private Coroutine scenePrewarmCoroutine = null;
     private int scenePrewarmGeneration = 0;
     private int scenePrewarmPending = 0;
@@ -366,10 +379,12 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
     private float vrRotationFilteredX = 0f;
     private float vrRotationFilteredY = 0f;
     private float pendingVrYaw = 0f;
-    private float pendingVrHeight = 0f;
+    private float pendingVrPitch = 0f;
     private bool vrSnapArmed = true;
     private string lastVrRotationDiag = "";
     private float nextVrRotationQuietDiagAt = 0f;
+    private float lastVrPivotDriftMm = 0f;
+    private float maxVrPivotDriftMm = 0f;
 
     // Clean high-contrast dark theme (desktop + VR readable)
     private static readonly Color colBg = new Color(0.14f, 0.16f, 0.20f, 0.96f);
@@ -522,7 +537,7 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
 
     private void LateUpdate() {
         try {
-            ApplyPendingVrYaw();
+            ApplyPendingVrRotation();
         } catch(Exception e) {
             DebugLog("LateUpdate FAILED: " + e.ToString());
         }
@@ -2343,13 +2358,16 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         if (root != null) Destroy(root);
         canvas=null; root=null; confirmRoot=null; subBarRoot=null; pageStripRoot=null; authorDropdownRoot=null; listContent=null; authorDropdownContent=null; header=null; details=null; preview=null; statusText=null; downloadProgressText=null; downloadProgressFill=null; hubDownloadButton=null; applyClothingToggle=null; applyHairToggle=null; searchInput=null; authorDropdownSearchInput=null; atomSelectorLabel=null; scenePrimaryPersonLabel=null;
         navRoot=null; settingsDrawerRoot=null; settingsBackdropRoot=null; emptyStateRoot=null;
-        atomRowRoot=null; presetOptionsRoot=null; presetModeRoot=null; presetActionRoot=null; sceneModeRoot=null; scenePersonRoot=null; sceneActionRoot=null; linkActionRoot=null; hubRowRoot=null; hubDownloadRoot=null; progressSectionRoot=null; dangerRowRoot=null; moreActionsRoot=null;
+        atomRowRoot=null; presetOptionsRoot=null; presetModeRoot=null; presetActionRoot=null; sceneModeRoot=null; scenePersonRoot=null; sceneAppearanceRoot=null; sceneActionRoot=null; linkActionRoot=null; hubRowRoot=null; hubDownloadRoot=null; progressSectionRoot=null; dangerRowRoot=null; moreActionsRoot=null;
         resultCountText=null; pageInfoText=null; searchPlaceholderText=null; cacheSizeText=null;
         settingsBtn=null; rescanTopBtn=null; searchClearBtn=null; clearNonEssentialCacheBtn=null; clearAllCacheBtn=null;
         loadSceneBtn=null; loadDeferredSceneBtn=null; sceneFullModeBtn=null; scenePrimaryModeBtn=null; sceneMinimalModeBtn=null; applyPresetBtn=null; loadScriptBtn=null; linkOnlyBtn=null; defaultKeepBtn=null; favToggleBtn=null;
         settingsDrawerOpen=false;
         selectedPreset=null; selectedVarPreset=null; selectedSceneItem=null; selectedWearableItem=null; selected=null;
         selectedSceneAnalysis=null;
+        sceneAppearanceSelections.Clear();
+        sceneAppearanceChoices.Clear();
+        sceneAppearanceChoiceLabels.Clear();
         tabBgs.Clear();
         favSubBtns.Clear();
         if (isVRMode && pageSizeBeforeVr > 0) { pageSize = pageSizeBeforeVr; pageSizeBeforeVr = 0; SaveConfig(); }
@@ -2400,10 +2418,12 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
                 if(k=="missingDepsDownloadRoot" && !string.IsNullOrEmpty(v)) missingDepsDownloadRoot=v;
                 if(k=="vrRotationEnabled") vrRotationEnabled=(v=="1" || v.Equals("true", StringComparison.OrdinalIgnoreCase));
                 if(k=="vrRotationSensitivity" && float.TryParse(v,out f)) vrRotationSensitivity=Mathf.Clamp(f,10f,180f);
-                if(k=="vrHeightSpeed" && float.TryParse(v,out f)) vrHeightSpeed=Mathf.Clamp(f,0.10f,3.00f);
+                if(k=="vrHeightSpeed" && float.TryParse(v,out f)) vrPitchSensitivity=Mathf.Clamp(f * (60f / 0.90f),10f,180f);
+                if(k=="vrPitchSensitivity" && float.TryParse(v,out f)) vrPitchSensitivity=Mathf.Clamp(f,10f,180f);
                 if(k=="vrRotationDeadzone" && float.TryParse(v,out f)) vrRotationDeadzone=Mathf.Clamp(f,0.05f,0.50f);
                 if(k=="vrRotationInvert") vrRotationInvert=(v=="1" || v.Equals("true", StringComparison.OrdinalIgnoreCase));
-                if(k=="vrHeightInvert") vrHeightInvert=(v=="1" || v.Equals("true", StringComparison.OrdinalIgnoreCase));
+                if(k=="vrHeightInvert") vrPitchInvert=(v=="1" || v.Equals("true", StringComparison.OrdinalIgnoreCase));
+                if(k=="vrPitchInvert") vrPitchInvert=(v=="1" || v.Equals("true", StringComparison.OrdinalIgnoreCase));
                 if(k=="vrRotationSnapAngle" && float.TryParse(v,out f)) vrRotationSnapAngle=Mathf.Clamp(f,0f,90f);
                 if(k=="vrRotationSmoothing" && float.TryParse(v,out f)) vrRotationSmoothing=Mathf.Clamp(f,0f,0.40f);
             }
@@ -2436,10 +2456,10 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
             sb.Append("missingDepsDownloadRoot=").Append(missingDepsDownloadRoot).Append('\n');
             sb.Append("vrRotationEnabled=").Append(vrRotationEnabled?"1":"0").Append('\n');
             sb.Append("vrRotationSensitivity=").Append(vrRotationSensitivity.ToString("R")).Append('\n');
-            sb.Append("vrHeightSpeed=").Append(vrHeightSpeed.ToString("R")).Append('\n');
+            sb.Append("vrPitchSensitivity=").Append(vrPitchSensitivity.ToString("R")).Append('\n');
             sb.Append("vrRotationDeadzone=").Append(vrRotationDeadzone.ToString("R")).Append('\n');
             sb.Append("vrRotationInvert=").Append(vrRotationInvert?"1":"0").Append('\n');
-            sb.Append("vrHeightInvert=").Append(vrHeightInvert?"1":"0").Append('\n');
+            sb.Append("vrPitchInvert=").Append(vrPitchInvert?"1":"0").Append('\n');
             sb.Append("vrRotationSnapAngle=").Append(vrRotationSnapAngle.ToString("R")).Append('\n');
             sb.Append("vrRotationSmoothing=").Append(vrRotationSmoothing.ToString("R")).Append('\n');
             string tmp = configPath + ".tmp";
@@ -2584,7 +2604,7 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         vrRotationFilteredX = 0f;
         vrRotationFilteredY = 0f;
         pendingVrYaw = 0f;
-        pendingVrHeight = 0f;
+        pendingVrPitch = 0f;
         vrSnapArmed = true;
     }
 
@@ -2715,7 +2735,7 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
 
     private void UpdateVrRotationInput() {
         pendingVrYaw = 0f;
-        pendingVrHeight = 0f;
+        pendingVrPitch = 0f;
         if (!vrRotationEnabled) {
             if (vrRotationModeActive) ExitVrRotationMode("disabled");
             return;
@@ -2743,9 +2763,11 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
             vrRotationFilteredY = 0f;
             vrSnapArmed = true;
             pendingVrYaw = 0f;
-            pendingVrHeight = 0f;
+            pendingVrPitch = 0f;
+            lastVrPivotDriftMm = 0f;
+            maxVrPivotDriftMm = 0f;
             DebugLog("VR look mode " + (vrRotationModeActive ? "ON" : "OFF") + " via " + sourceName + " LeftStickClick");
-            SetStatus("镜头模式：" + (vrRotationModeActive ? "开（左右转向 / 前后升降，再按摇杆退出）" : "关"), true);
+            SetStatus("镜头模式：" + (vrRotationModeActive ? "开（左右转向 / 前后翻转，再按摇杆退出）" : "关"), true);
         }
 
         if (!vrRotationModeActive) {
@@ -2762,7 +2784,7 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         float targetX = NormalizeStickAxis(stickX);
         float targetY = NormalizeStickAxis(stickY);
         if (vrRotationInvert) targetX = -targetX;
-        if (vrHeightInvert) targetY = -targetY;
+        if (vrPitchInvert) targetY = -targetY;
         float dt = Mathf.Min(Time.unscaledDeltaTime, 0.05f);
         vrRotationFilteredX = SmoothStickAxis(vrRotationFilteredX, targetX, dt);
         vrRotationFilteredY = SmoothStickAxis(vrRotationFilteredY, targetY, dt);
@@ -2783,16 +2805,18 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
             }
         }
 
-        // Stick Y -> vertical height (raise / lower view)
+        // Stick Y -> continuous pitch around the current HMD world position.
         if (Mathf.Abs(vrRotationFilteredY) >= 0.001f) {
-            float hSpeed = Mathf.Clamp(vrHeightSpeed, 0.10f, 3.00f);
-            pendingVrHeight = vrRotationFilteredY * hSpeed * dt;
+            float pitchSpeed = Mathf.Clamp(vrPitchSensitivity, 10f, 180f);
+            pendingVrPitch = vrRotationFilteredY * pitchSpeed * dt;
         }
 
         string diag = "mode=1 src=" + sourceName
             + " x=" + stickX.ToString("0.00") + " y=" + stickY.ToString("0.00")
             + " yaw=" + pendingVrYaw.ToString("0.00")
-            + " h=" + pendingVrHeight.ToString("0.000");
+            + " pitch=" + pendingVrPitch.ToString("0.00")
+            + " pivotDriftMm=" + lastVrPivotDriftMm.ToString("0.000")
+            + " maxPivotDriftMm=" + maxVrPivotDriftMm.ToString("0.000");
         if (diag != lastVrRotationDiag && Time.realtimeSinceStartup >= nextVrRotationQuietDiagAt) {
             lastVrRotationDiag = diag;
             nextVrRotationQuietDiagAt = Time.realtimeSinceStartup + 2f;
@@ -2800,9 +2824,9 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         }
     }
 
-    private void ApplyPendingVrYaw() {
+    private void ApplyPendingVrRotation() {
         if (!vrRotationModeActive) return;
-        if (ShouldPauseVrRotation()) { pendingVrYaw = 0f; pendingVrHeight = 0f; return; }
+        if (ShouldPauseVrRotation()) { pendingVrYaw = 0f; pendingVrPitch = 0f; return; }
 
         if (Mathf.Abs(pendingVrYaw) >= 0.0001f) {
             Transform rig = GetNavigationRigTransform();
@@ -2813,10 +2837,11 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
             } else pendingVrYaw = 0f;
         }
 
-        if (Mathf.Abs(pendingVrHeight) >= 0.00001f) {
-            float dh = pendingVrHeight;
-            pendingVrHeight = 0f;
-            ApplyVrHeightDelta(dh);
+        if (Mathf.Abs(pendingVrPitch) >= 0.0001f) {
+            Transform rig = GetNavigationRigTransform();
+            float pitch = pendingVrPitch;
+            pendingVrPitch = 0f;
+            if (rig != null) ApplyVrPitchAroundHeadset(rig, pitch);
         }
     }
 
@@ -2829,23 +2854,23 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         rig.rotation = q * rig.rotation;
     }
 
-    private void ApplyVrHeightDelta(float deltaMeters) {
-        if (Mathf.Abs(deltaMeters) < 0.00001f) return;
+    private void ApplyVrPitchAroundHeadset(Transform rig, float deltaPitch) {
+        if (rig == null || Mathf.Abs(deltaPitch) < 0.0001f) return;
+        Vector3 pivot = GetVrRotationPivot();
+        Transform view = null;
         try {
-            SuperController sc = SuperController.singleton;
-            if (sc != null) {
-                // VaM-native player height offset (same as in-game height slider).
-                sc.playerHeightAdjustAdjust(deltaMeters);
-                return;
-            }
-        } catch (Exception e) {
-            DebugLog("playerHeightAdjustAdjust failed: " + e.Message);
-        }
-        // Fallback: translate navigation rig in world up.
-        try {
-            Transform rig = GetNavigationRigTransform();
-            if (rig != null) rig.position += Vector3.up * deltaMeters;
+            if (SuperController.singleton != null && SuperController.singleton.navigationCamera != null) view = SuperController.singleton.navigationCamera;
         } catch {}
+        if (view == null) view = GetViewTransform();
+        Vector3 axis = view != null ? view.right : rig.right;
+        if (axis.sqrMagnitude < 0.000001f) return;
+        Quaternion q = Quaternion.AngleAxis(deltaPitch, axis.normalized);
+        Vector3 offset = rig.position - pivot;
+        rig.position = pivot + q * offset;
+        rig.rotation = q * rig.rotation;
+        Vector3 after = GetVrRotationPivot();
+        lastVrPivotDriftMm = Vector3.Distance(pivot, after) * 1000f;
+        if (lastVrPivotDriftMm > maxVrPivotDriftMm) maxVrPivotDriftMm = lastVrPivotDriftMm;
     }
 
     private void ScheduleVrOpenRetry(string reason) {
@@ -3917,6 +3942,9 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         LayoutElement scenePersonLe = scenePrimaryPersonLabel.gameObject.AddComponent<LayoutElement>();
         scenePersonLe.flexibleWidth = 1f; scenePersonLe.minHeight = isVRMode ? 46f : 40f;
 
+        sceneAppearanceRoot = CreateStackSection(detailContent.transform, "SceneAppearanceOverrides", 6, 6, isVRMode ? 54f : 48f);
+        sceneAppearanceRoot.SetActive(false);
+
         // Primary actions - only one relevant will show
         sceneActionRoot = CreateRow(detailContent.transform, "SceneActionRow", isVRMode ? 50f : 46f, 8, true);
         loadSceneBtn = MakeButton(sceneActionRoot.transform, "加载场景", isVRMode ? 17 : 16, colAccent);
@@ -3981,7 +4009,7 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         downloadProgressText.raycastTarget = false;
         StretchFull(downloadProgressText.rectTransform, 8, 8, 4, 4);
 
-        Text hint = MakeText(detailContent.transform, "Hint", "F8/F7 打开 · VR:左摇杆按下=镜头模式（左右转/前后升降）", 12, TextAnchor.MiddleCenter, colTextDim);
+        Text hint = MakeText(detailContent.transform, "Hint", "F8/F7 打开 · VR:左摇杆按下=镜头模式（左右转/前后翻转）", 12, TextAnchor.MiddleCenter, colTextDim);
         hint.horizontalOverflow = HorizontalWrapMode.Wrap;
         hint.verticalOverflow = VerticalWrapMode.Overflow;
         SetFixedHeight(hint.gameObject, 28f);
@@ -4828,6 +4856,7 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
     private void SelectSceneItem(SceneLite si) {
         if (si == null || details == null) return;
         StopScenePrewarm(true);
+        ClearSceneAppearanceState();
         selected = si.package;
         selectedPreset = null;
         selectedVarPreset = null;
@@ -4837,6 +4866,7 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         selectedSceneAnalysis = ReadAndAnalyzeScene(si.package, si.entryPath, "");
         if (selectedSceneAnalysis != null && selectedSceneAnalysis.personIds.Count > 0
             && !selectedSceneAnalysis.personIds.Contains(scenePrimaryPersonId)) scenePrimaryPersonId = selectedSceneAnalysis.personIds[0];
+        RebuildSceneAppearanceControls();
         RefreshSelectedSceneDetails();
         UpdateAtomSelectorUI();
         UpdateInspectorVisibility();
@@ -4867,12 +4897,159 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
             analysis.json = json;
             string error;
             if (!TryAnalyzeSceneAtoms(json, analysis, out error)) analysis.error = error;
-            DebugLog("Scene analysis: key=" + key + ", bytes=" + Encoding.UTF8.GetByteCount(json) + ", atoms=" + analysis.atoms.Count + ", persons=" + analysis.personIds.Count + ", error=" + analysis.error);
+            DebugLog("Scene analysis: key=" + key + ", bytes=" + Encoding.UTF8.GetByteCount(json) + ", atoms=" + analysis.atoms.Count + ", persons=" + analysis.personIds.Count + ", femalePersons=" + analysis.femalePersonIds.Count + ", error=" + analysis.error);
         } catch(Exception e) {
             analysis.error = e.Message;
             DebugLog("Scene analysis failed: key=" + key + " | " + e.ToString());
         }
         return analysis;
+    }
+
+    private void ClearSceneAppearanceState() {
+        sceneAppearanceSelections.Clear();
+        sceneAppearanceChoices.Clear();
+        sceneAppearanceChoiceLabels.Clear();
+        if (sceneAppearanceRoot == null) return;
+        for (int i = sceneAppearanceRoot.transform.childCount - 1; i >= 0; i--) {
+            Transform child = sceneAppearanceRoot.transform.GetChild(i);
+            child.SetParent(null, false);
+            Destroy(child.gameObject);
+        }
+        sceneAppearanceRoot.SetActive(false);
+    }
+
+    private string ReadSceneAppearancePresetJson(PresetLite local, VarPresetLite packagePreset, out string source, out string packageUid) {
+        source = "";
+        packageUid = "";
+        if (local != null) {
+            FileInfo fi = new FileInfo(local.fullPath);
+            if (!fi.Exists || fi.Length <= 0 || fi.Length > 20L * 1024L * 1024L) return "";
+            source = local.fullPath;
+            return File.ReadAllText(local.fullPath, Encoding.UTF8);
+        }
+        if (packagePreset == null || packagePreset.package == null) return "";
+        byte[] data = ReadBytes(packagePreset.package, packagePreset.entryPath, 20L * 1024L * 1024L);
+        if (data == null || data.Length == 0) return "";
+        packageUid = packagePreset.package.uid;
+        source = packagePreset.package.uid + ":/" + Norm(packagePreset.entryPath);
+        string json = Encoding.UTF8.GetString(data);
+        if (!string.IsNullOrEmpty(packageUid)) json = json.Replace("SELF:/", packageUid + ":/");
+        return json;
+    }
+
+    private void AddFavoriteSceneAppearanceChoice(PresetLite local, VarPresetLite packagePreset) {
+        try {
+            string source, packageUid;
+            string json = ReadSceneAppearancePresetJson(local, packagePreset, out source, out packageUid);
+            if (string.IsNullOrEmpty(json)) return;
+            int rootStart = 0;
+            while (rootStart < json.Length && char.IsWhiteSpace(json[rootStart])) rootStart++;
+            if (rootStart >= json.Length || json[rootStart] != '{') return;
+            int rootEnd = FindMatchingJsonContainer(json, rootStart, '{', '}');
+            if (rootEnd < 0) return;
+            string character;
+            string gender = ClassifyPersonGender(json, rootStart, rootEnd + 1, out character);
+            if (!string.Equals(gender, "Female", StringComparison.Ordinal)) {
+                DebugLog("Scene appearance candidate skipped: gender=" + gender + ", character=" + character + ", source=" + source);
+                return;
+            }
+            SceneAppearanceChoice choice = new SceneAppearanceChoice();
+            choice.source = source;
+            choice.packageUid = packageUid;
+            choice.json = json;
+            if (local != null) {
+                choice.key = "local|" + local.fullPath;
+                choice.label = "本地: " + PresetDisplayNameFromPath(local.fullPath);
+            } else {
+                choice.key = "var|" + packagePreset.package.uid + "|" + packagePreset.entryPath;
+                choice.label = "VAR: " + PresetDisplayNameFromPath(packagePreset.entryPath);
+            }
+            for (int i = 0; i < sceneAppearanceChoices.Count; i++) if (string.Equals(sceneAppearanceChoices[i].key, choice.key, StringComparison.OrdinalIgnoreCase)) return;
+            sceneAppearanceChoices.Add(choice);
+        } catch(Exception e) {
+            DebugLog("Scene appearance candidate failed: " + e.Message);
+        }
+    }
+
+    private void BuildFavoriteSceneAppearanceChoices() {
+        sceneAppearanceChoices.Clear();
+        for (int i = 0; i < localPresets.Count; i++) {
+            PresetLite pr = localPresets[i];
+            if (pr == null || !string.Equals(pr.presetType, "Appearance", StringComparison.OrdinalIgnoreCase)
+                || !favoritePresets.Contains(pr.fullPath)) continue;
+            AddFavoriteSceneAppearanceChoice(pr, null);
+        }
+        for (int i = 0; i < varPresets.Count; i++) {
+            VarPresetLite vp = varPresets[i];
+            if (vp == null || vp.package == null || !string.Equals(vp.presetType, "Appearance", StringComparison.OrdinalIgnoreCase)
+                || !favoriteUids.Contains(vp.package.uid)) continue;
+            AddFavoriteSceneAppearanceChoice(null, vp);
+        }
+        sceneAppearanceChoices.Sort(delegate(SceneAppearanceChoice a, SceneAppearanceChoice b) { return string.Compare(a.label, b.label, StringComparison.OrdinalIgnoreCase); });
+        DebugLog("Scene appearance favorite choices=" + sceneAppearanceChoices.Count);
+    }
+
+    private string SceneAppearanceChoiceLabel(string key) {
+        if (string.IsNullOrEmpty(key)) return "保持原样";
+        for (int i = 0; i < sceneAppearanceChoices.Count; i++) if (string.Equals(sceneAppearanceChoices[i].key, key, StringComparison.OrdinalIgnoreCase)) return sceneAppearanceChoices[i].label;
+        return "保持原样";
+    }
+
+    private void CycleSceneAppearanceChoice(string personId, int delta) {
+        if (string.IsNullOrEmpty(personId)) return;
+        string key;
+        sceneAppearanceSelections.TryGetValue(personId, out key);
+        int index = 0;
+        for (int i = 0; i < sceneAppearanceChoices.Count; i++) {
+            if (string.Equals(sceneAppearanceChoices[i].key, key, StringComparison.OrdinalIgnoreCase)) { index = i + 1; break; }
+        }
+        int count = sceneAppearanceChoices.Count + 1;
+        index = (index + delta) % count;
+        if (index < 0) index += count;
+        key = index == 0 ? "" : sceneAppearanceChoices[index - 1].key;
+        if (string.IsNullOrEmpty(key)) sceneAppearanceSelections.Remove(personId); else sceneAppearanceSelections[personId] = key;
+        Text label;
+        if (sceneAppearanceChoiceLabels.TryGetValue(personId, out label) && label != null) label.text = OneLine(SceneAppearanceChoiceLabel(key), 26);
+        RefreshSelectedSceneDetails();
+        SetStatus(personId + " 启动外观：" + SceneAppearanceChoiceLabel(key), true);
+    }
+
+    private void RebuildSceneAppearanceControls() {
+        if (sceneAppearanceRoot == null) return;
+        for (int i = sceneAppearanceRoot.transform.childCount - 1; i >= 0; i--) {
+            Transform child = sceneAppearanceRoot.transform.GetChild(i);
+            child.SetParent(null, false);
+            Destroy(child.gameObject);
+        }
+        sceneAppearanceChoiceLabels.Clear();
+        bool show = selectedSceneItem != null && selectedSceneAnalysis != null && selectedSceneAnalysis.femalePersonIds.Count > 0;
+        sceneAppearanceRoot.SetActive(show);
+        if (!show) return;
+        BuildFavoriteSceneAppearanceChoices();
+        Text title = MakeText(sceneAppearanceRoot.transform, "Title", "启动外观（女性 Person）", isVRMode ? 14 : 13, TextAnchor.MiddleLeft, colAccent);
+        SetFixedHeight(title.gameObject, isVRMode ? 28f : 24f);
+        for (int i = 0; i < selectedSceneAnalysis.femalePersonIds.Count; i++) {
+            string personId = selectedSceneAnalysis.femalePersonIds[i];
+            GameObject row = CreateRow(sceneAppearanceRoot.transform, "Appearance_" + SafeFileName(personId), isVRMode ? 48f : 42f, 5, true);
+            Text person = MakeText(row.transform, "Person", OneLine(personId, 14), isVRMode ? 13 : 12, TextAnchor.MiddleLeft, colTextPrimary);
+            SetFlexibleItem(person.gameObject, isVRMode ? 100f : 86f, 0.55f);
+            Button previous = MakeButton(row.transform, "<", isVRMode ? 18 : 16, colBtn);
+            SetFlexibleItem(previous.gameObject, isVRMode ? 42f : 34f, 0f);
+            Button selectedChoice = MakeButton(row.transform, "保持原样", isVRMode ? 13 : 12, colAccentDim);
+            SetFlexibleItem(selectedChoice.gameObject, 120f, 1.45f);
+            Button next = MakeButton(row.transform, ">", isVRMode ? 18 : 16, colBtn);
+            SetFlexibleItem(next.gameObject, isVRMode ? 42f : 34f, 0f);
+            Text selectedText = selectedChoice.GetComponentInChildren<Text>();
+            sceneAppearanceChoiceLabels[personId] = selectedText;
+            string capturedPersonId = personId;
+            previous.onClick.AddListener(() => CycleSceneAppearanceChoice(capturedPersonId, -1));
+            selectedChoice.onClick.AddListener(() => CycleSceneAppearanceChoice(capturedPersonId, 1));
+            next.onClick.AddListener(() => CycleSceneAppearanceChoice(capturedPersonId, 1));
+        }
+        if (sceneAppearanceChoices.Count == 0) {
+            Text empty = MakeText(sceneAppearanceRoot.transform, "Empty", "收藏中没有女性 Appearance 预设", 12, TextAnchor.MiddleLeft, colTextDim);
+            SetFixedHeight(empty.gameObject, 28f);
+        }
     }
 
     private void RefreshSelectedSceneDetails() {
@@ -4885,9 +5062,11 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         if (selectedSceneAnalysis != null) {
             if (string.IsNullOrEmpty(selectedSceneAnalysis.error)) {
                 sb.Append("\nAtom：").Append(selectedSceneAnalysis.atoms.Count)
-                  .Append("  人物：").Append(selectedSceneAnalysis.personIds.Count);
+                  .Append("  人物：").Append(selectedSceneAnalysis.personIds.Count)
+                  .Append("  女性：").Append(selectedSceneAnalysis.femalePersonIds.Count);
                 if (!string.IsNullOrEmpty(scenePrimaryPersonId)) sb.Append("\n主角：").Append(scenePrimaryPersonId);
                 sb.Append("  模式：").Append(SceneLoadModeName(sceneLoadMode));
+                if (sceneAppearanceSelections.Count > 0) sb.Append("\n启动外观替换：").Append(sceneAppearanceSelections.Count).Append(" 人");
             } else sb.Append("\n分析失败：").Append(selectedSceneAnalysis.error);
         }
         details.text = sb.ToString();
@@ -5108,11 +5287,65 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
             atom.length = objectClose - cursor + 1;
             TryFindDirectStringProperty(json, cursor, objectClose + 1, "id", out atom.id);
             TryFindDirectStringProperty(json, cursor, objectClose + 1, "type", out atom.type);
+            if (string.Equals(atom.type, "Person", StringComparison.OrdinalIgnoreCase)) {
+                atom.gender = ClassifyPersonGender(json, cursor, objectClose + 1, out atom.character);
+            }
             analysis.atoms.Add(atom);
-            if (string.Equals(atom.type, "Person", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrEmpty(atom.id)) analysis.personIds.Add(atom.id);
+            if (string.Equals(atom.type, "Person", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrEmpty(atom.id)) {
+                analysis.personIds.Add(atom.id);
+                if (string.Equals(atom.gender, "Female", StringComparison.Ordinal)) analysis.femalePersonIds.Add(atom.id);
+            }
             cursor = objectClose + 1;
         }
         return true;
+    }
+
+    private static string ClassifyPersonGender(string json, int objectStart, int objectEnd, out string character) {
+        character = "";
+        TimelinePropertySpan storables = FindTimelineDirectProperty(json, objectStart, objectEnd, "storables");
+        if (storables == null || storables.kind != '[') return "Unknown";
+        List<TimelineObjectSpan> items;
+        try { items = ReadTimelineObjectArray(json, storables.start, storables.start + storables.length); }
+        catch { return "Unknown"; }
+        TimelineObjectSpan geometry = null;
+        for (int i = 0; i < items.Count; i++) {
+            string id;
+            if (TryFindDirectStringProperty(json, items[i].start, items[i].start + items[i].length, "id", out id)
+                && string.Equals(id, "geometry", StringComparison.OrdinalIgnoreCase)) {
+                geometry = items[i];
+                break;
+            }
+        }
+        if (geometry == null) return "Unknown";
+        TryFindDirectStringProperty(json, geometry.start, geometry.start + geometry.length, "character", out character);
+        string normalized = (character ?? "").Trim().ToLowerInvariant();
+        if (normalized.StartsWith("futa", StringComparison.Ordinal)) return "Mixed";
+        if (normalized.StartsWith("female ", StringComparison.Ordinal) || normalized == "female"
+            || normalized == "lexi" || normalized == "kayla" || normalized == "tara"
+            || normalized == "candy" || normalized == "tina" || normalized == "evey"
+            || normalized == "janie" || normalized == "simone" || normalized == "maria") return "Female";
+        if (normalized.StartsWith("male ", StringComparison.Ordinal) || normalized == "male"
+            || normalized == "lee" || normalized == "julian") return "Male";
+
+        string geometryJson = json.Substring(geometry.start, geometry.length).ToLowerInvariant();
+        int femaleHints = CountOccurrences(geometryJson, "/custom/clothing/female/")
+            + CountOccurrences(geometryJson, "/custom/hair/female/")
+            + CountOccurrences(geometryJson, "/custom/atom/person/morphs/female/")
+            + CountOccurrences(geometryJson, "/custom/atom/person/morphs/female_");
+        int maleHints = CountOccurrences(geometryJson, "/custom/clothing/male/")
+            + CountOccurrences(geometryJson, "/custom/hair/male/")
+            + CountOccurrences(geometryJson, "/custom/atom/person/morphs/male/")
+            + CountOccurrences(geometryJson, "/custom/atom/person/morphs/male_");
+        if (femaleHints > 0 && maleHints == 0) return "Female";
+        if (maleHints > 0 && femaleHints == 0) return "Male";
+        return "Unknown";
+    }
+
+    private static int CountOccurrences(string text, string value) {
+        if (string.IsNullOrEmpty(text) || string.IsNullOrEmpty(value)) return 0;
+        int count = 0, at = 0;
+        while ((at = text.IndexOf(value, at, StringComparison.Ordinal)) >= 0) { count++; at += value.Length; }
+        return count;
     }
 
     private static bool TryFindTopLevelArrayProperty(string json, string property, out int arrayOpen) {
@@ -5270,6 +5503,145 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
             cursor = next;
         }
         return result;
+    }
+
+    private SceneAppearanceChoice FindSceneAppearanceChoice(string key) {
+        if (string.IsNullOrEmpty(key)) return null;
+        for (int i = 0; i < sceneAppearanceChoices.Count; i++) {
+            if (string.Equals(sceneAppearanceChoices[i].key, key, StringComparison.OrdinalIgnoreCase)) return sceneAppearanceChoices[i];
+        }
+        return null;
+    }
+
+    private static bool IsAllowedAppearanceStorable(string id) {
+        if (string.IsNullOrEmpty(id)) return false;
+        if (string.Equals(id, "control", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(id, "PluginManager", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(id, "MotionAnimationControl", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(id, "AnimationPlayer", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(id, "Possess", StringComparison.OrdinalIgnoreCase)) return false;
+        if (id.IndexOf("VamTimeline", StringComparison.OrdinalIgnoreCase) >= 0
+            || id.IndexOf("AnimationPattern", StringComparison.OrdinalIgnoreCase) >= 0) return false;
+        return true;
+    }
+
+    private static bool TryMergeAppearancePresetIntoPerson(string sceneJson, SceneAtomSpan atom, string presetJson, out string mergedAtom, out int replacedStorables, out int addedStorables, out string error) {
+        mergedAtom = "";
+        replacedStorables = 0;
+        addedStorables = 0;
+        error = "";
+        if (string.IsNullOrEmpty(sceneJson) || atom == null || string.IsNullOrEmpty(presetJson)) { error = "输入 JSON 为空"; return false; }
+        TimelinePropertySpan sceneStorables = FindTimelineDirectProperty(sceneJson, atom.start, atom.start + atom.length, "storables");
+        if (sceneStorables == null || sceneStorables.kind != '[') { error = "Person 没有 storables 数组"; return false; }
+        int presetRoot = 0;
+        while (presetRoot < presetJson.Length && (char.IsWhiteSpace(presetJson[presetRoot]) || presetJson[presetRoot] == '\uFEFF')) presetRoot++;
+        if (presetRoot >= presetJson.Length || presetJson[presetRoot] != '{') { error = "Appearance 预设根对象无效"; return false; }
+        int presetClose = FindMatchingJsonContainer(presetJson, presetRoot, '{', '}');
+        if (presetClose < 0) { error = "Appearance 预设根对象未闭合"; return false; }
+        TimelinePropertySpan presetStorables = FindTimelineDirectProperty(presetJson, presetRoot, presetClose + 1, "storables");
+        if (presetStorables == null || presetStorables.kind != '[') { error = "Appearance 预设没有 storables 数组"; return false; }
+
+        List<TimelineObjectSpan> sceneItems;
+        List<TimelineObjectSpan> presetItems;
+        try {
+            sceneItems = ReadTimelineObjectArray(sceneJson, sceneStorables.start, sceneStorables.start + sceneStorables.length);
+            presetItems = ReadTimelineObjectArray(presetJson, presetStorables.start, presetStorables.start + presetStorables.length);
+        } catch(Exception e) { error = e.Message; return false; }
+
+        Dictionary<string, string> presetById = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        List<string> presetOrder = new List<string>();
+        bool hasGeometry = false;
+        for (int i = 0; i < presetItems.Count; i++) {
+            TimelineObjectSpan item = presetItems[i];
+            string id;
+            if (!TryFindDirectStringProperty(presetJson, item.start, item.start + item.length, "id", out id) || !IsAllowedAppearanceStorable(id)) continue;
+            if (string.Equals(id, "geometry", StringComparison.OrdinalIgnoreCase)) hasGeometry = true;
+            if (!presetById.ContainsKey(id)) presetOrder.Add(id);
+            presetById[id] = presetJson.Substring(item.start, item.length);
+        }
+        if (!hasGeometry) { error = "Appearance 预设没有 geometry storable"; return false; }
+
+        StringBuilder storables = new StringBuilder(sceneStorables.length + presetJson.Length);
+        storables.Append('[');
+        bool first = true;
+        HashSet<string> consumed = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        for (int i = 0; i < sceneItems.Count; i++) {
+            TimelineObjectSpan item = sceneItems[i];
+            string id;
+            bool hasId = TryFindDirectStringProperty(sceneJson, item.start, item.start + item.length, "id", out id);
+            string replacement;
+            if (hasId && presetById.TryGetValue(id, out replacement) && consumed.Add(id)) {
+                if (!first) storables.Append(',');
+                storables.Append(replacement);
+                first = false;
+                replacedStorables++;
+            } else {
+                if (!first) storables.Append(',');
+                storables.Append(sceneJson, item.start, item.length);
+                first = false;
+            }
+        }
+        for (int i = 0; i < presetOrder.Count; i++) {
+            string id = presetOrder[i];
+            if (consumed.Contains(id)) continue;
+            if (!first) storables.Append(',');
+            storables.Append(presetById[id]);
+            first = false;
+            addedStorables++;
+        }
+        storables.Append(']');
+
+        int atomEnd = atom.start + atom.length;
+        StringBuilder merged = new StringBuilder(atom.length - sceneStorables.length + storables.Length);
+        merged.Append(sceneJson, atom.start, sceneStorables.start - atom.start);
+        merged.Append(storables.ToString());
+        int suffixStart = sceneStorables.start + sceneStorables.length;
+        merged.Append(sceneJson, suffixStart, atomEnd - suffixStart);
+        mergedAtom = merged.ToString();
+        return true;
+    }
+
+    private bool TryApplySceneAppearanceOverrides(string sceneJson, SceneJsonAnalysis analysis, out string rewritten, out int applied, out List<string> errors) {
+        rewritten = sceneJson;
+        applied = 0;
+        errors = new List<string>();
+        if (analysis == null || string.IsNullOrEmpty(sceneJson) || sceneAppearanceSelections.Count == 0) return true;
+        List<SceneAtomReplacement> replacements = new List<SceneAtomReplacement>();
+        for (int i = 0; i < analysis.atoms.Count; i++) {
+            SceneAtomSpan atom = analysis.atoms[i];
+            if (!string.Equals(atom.type, "Person", StringComparison.OrdinalIgnoreCase)
+                || !string.Equals(atom.gender, "Female", StringComparison.Ordinal)) continue;
+            string choiceKey;
+            if (!sceneAppearanceSelections.TryGetValue(atom.id, out choiceKey) || string.IsNullOrEmpty(choiceKey)) continue;
+            SceneAppearanceChoice choice = FindSceneAppearanceChoice(choiceKey);
+            if (choice == null) { errors.Add(atom.id + "：所选预设已不可用"); continue; }
+            string mergedAtom, mergeError;
+            int replacedStorables, addedStorables;
+            if (!TryMergeAppearancePresetIntoPerson(sceneJson, atom, choice.json, out mergedAtom, out replacedStorables, out addedStorables, out mergeError)) {
+                errors.Add(atom.id + "：" + mergeError);
+                continue;
+            }
+            SceneAtomReplacement replacement = new SceneAtomReplacement();
+            replacement.start = atom.start;
+            replacement.length = atom.length;
+            replacement.text = mergedAtom;
+            replacements.Add(replacement);
+            applied++;
+            DebugLog("Scene appearance prepared: person=" + atom.id + ", character=" + atom.character + ", preset=" + choice.source + ", replacedStorables=" + replacedStorables + ", addedStorables=" + addedStorables);
+        }
+        if (replacements.Count == 0) return errors.Count == 0;
+        replacements.Sort(delegate(SceneAtomReplacement a, SceneAtomReplacement b) { return a.start.CompareTo(b.start); });
+        StringBuilder output = new StringBuilder(sceneJson.Length);
+        int cursor = 0;
+        for (int i = 0; i < replacements.Count; i++) {
+            SceneAtomReplacement replacement = replacements[i];
+            output.Append(sceneJson, cursor, replacement.start - cursor);
+            output.Append(replacement.text);
+            cursor = replacement.start + replacement.length;
+        }
+        output.Append(sceneJson, cursor, sceneJson.Length - cursor);
+        rewritten = output.ToString();
+        return errors.Count == 0;
     }
 
     private static bool TryBuildSceneVariants(SceneJsonAnalysis analysis, int mode, string primaryPersonId, out SceneVariantResult result, out string error) {
@@ -6628,6 +7000,7 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         if(selectedSceneAnalysis==null && selectedSceneItem==null)return;
         StopScenePrewarm(true);
         selectedSceneAnalysis=null;
+        ClearSceneAppearanceState();
     }
     private void SelectPackage(PackageLite p){
         LeaveSceneSelection();
@@ -6733,10 +7106,13 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
             Stopwatch rootDepsSw = Stopwatch.StartNew();
             LinkResult result=LinkWithDeps(p);
             rootDepsSw.Stop();
-            double sceneReadMs = 0, sceneRefsMs = 0, sceneVariantMs = 0, localizeMs = 0;
+            double sceneReadMs = 0, sceneAppearanceMs = 0, sceneRefsMs = 0, sceneVariantMs = 0, localizeMs = 0;
             string sceneJson = "";
             string sceneLoadPath = SceneRef(p, scene);
             SceneVariantResult sceneVariant = null;
+            int sceneAppearanceApplied = 0;
+            bool sceneAppearanceChanged = false;
+            List<string> sceneAppearanceErrors = new List<string>();
             int localizedScripts = 0;
             bool localizedScriptsChanged = false;
             TimelineOptimizationInfo timelineInfo = new TimelineOptimizationInfo();
@@ -6759,20 +7135,41 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
                     sceneReadMs = stepSw.Elapsed.TotalMilliseconds;
                     selectedSceneAnalysis = ReadAndAnalyzeScene(p, scene, sceneJson);
                     if (selectedSceneAnalysis.personIds.Count > 0 && !selectedSceneAnalysis.personIds.Contains(scenePrimaryPersonId)) scenePrimaryPersonId = selectedSceneAnalysis.personIds[0];
+                    string appearancePreparedJson = sceneJson;
+                    SceneJsonAnalysis loadAnalysis = selectedSceneAnalysis;
                     stepSw = Stopwatch.StartNew();
-                    PresetLinkDiag sceneDiag = AutoLinkSceneDepsDetailed(sceneJson);
+                    TryApplySceneAppearanceOverrides(sceneJson, selectedSceneAnalysis, out appearancePreparedJson, out sceneAppearanceApplied, out sceneAppearanceErrors);
+                    if (sceneAppearanceApplied > 0) {
+                        SceneJsonAnalysis rewrittenAnalysis = new SceneJsonAnalysis();
+                        rewrittenAnalysis.key = requestedSceneKey;
+                        rewrittenAnalysis.json = appearancePreparedJson;
+                        string rewrittenError;
+                        if (TryAnalyzeSceneAtoms(appearancePreparedJson, rewrittenAnalysis, out rewrittenError)) {
+                            loadAnalysis = rewrittenAnalysis;
+                            sceneAppearanceChanged = true;
+                        } else {
+                            sceneAppearanceErrors.Add("合并结果验证失败：" + rewrittenError);
+                            appearancePreparedJson = sceneJson;
+                            sceneAppearanceApplied = 0;
+                        }
+                    }
+                    stepSw.Stop();
+                    sceneAppearanceMs = stepSw.Elapsed.TotalMilliseconds;
+                    for (int ae = 0; ae < sceneAppearanceErrors.Count; ae++) DebugLog("Scene appearance issue: " + sceneAppearanceErrors[ae]);
+                    stepSw = Stopwatch.StartNew();
+                    PresetLinkDiag sceneDiag = AutoLinkSceneDepsDetailed(appearancePreparedJson);
                     stepSw.Stop();
                     sceneRefsMs = stepSw.Elapsed.TotalMilliseconds;
                     result.created += sceneDiag.linked;
                     result.already += sceneDiag.already;
                     for (int i = 0; i < sceneDiag.missing.Count; i++) if (!result.missing.Contains(sceneDiag.missing[i])) result.missing.Add(sceneDiag.missing[i]);
                     for (int i = 0; i < sceneDiag.errors.Count; i++) result.errors.Add(sceneDiag.errors[i]);
-                    string preparedSceneJson = sceneJson;
+                    string preparedSceneJson = appearancePreparedJson;
                     if (sceneLoadMode > 0) {
                         stepSw = Stopwatch.StartNew();
                         string variantError;
                         SceneVariantResult builtVariant;
-                        if (TryBuildSceneVariants(selectedSceneAnalysis, sceneLoadMode, scenePrimaryPersonId, out builtVariant, out variantError)) {
+                        if (TryBuildSceneVariants(loadAnalysis, sceneLoadMode, scenePrimaryPersonId, out builtVariant, out variantError)) {
                             sceneVariant = builtVariant;
                             preparedSceneJson = builtVariant.primaryJson;
                             DebugLog("Scene variant built: mode=" + SceneLoadModeName(sceneLoadMode) + ", primary=" + scenePrimaryPersonId + ", total=" + builtVariant.totalAtoms + ", kept=" + builtVariant.keptAtoms + ", deferred=" + builtVariant.deferredAtoms + ", deferredTypes=" + string.Join(",", builtVariant.deferredTypes.ToArray()));
@@ -6789,7 +7186,7 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
                         bool primaryScriptsChanged;
                         string localScene = MaterializeSceneWithLocalScripts(p, scene, preparedSceneJson, out localizedScripts, out localizationErrors, out primaryScriptsChanged);
                         localizedScriptsChanged |= primaryScriptsChanged;
-                        if (string.IsNullOrEmpty(localScene) && sceneVariant != null && sceneVariant.deferredAtoms > 0) localScene = WritePreparedSceneTemp(p, scene, preparedSceneJson, "primary");
+                        if (string.IsNullOrEmpty(localScene) && (sceneAppearanceChanged || (sceneVariant != null && sceneVariant.deferredAtoms > 0))) localScene = WritePreparedSceneTemp(p, scene, preparedSceneJson, "primary");
                         stepSw.Stop();
                         localizeMs = stepSw.Elapsed.TotalMilliseconds;
                         if (!string.IsNullOrEmpty(localScene)) sceneLoadPath = localScene;
@@ -6837,12 +7234,14 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
             string sceneRef=SceneRef(p,scene);
             string msg="正在加载场景 "+sceneRef+" | 清理旧链接="+autoDeleted+"，新建链接="+result.created+"，已存在="+result.already+"，缺失依赖="+result.missing.Count+"，错误="+result.errors.Count+" | 准备="+totalSw.Elapsed.TotalSeconds.ToString("0.0")+"s";
             if(sceneVariant!=null && sceneVariant.deferredAtoms>0) msg+=" | "+SceneLoadModeName(sceneLoadMode)+"="+sceneVariant.keptAtoms+"/"+sceneVariant.totalAtoms+"，其余="+sceneVariant.deferredAtoms;
+            if(sceneAppearanceApplied>0) msg+=" | 启动外观="+sceneAppearanceApplied+"人";
+            if(sceneAppearanceErrors.Count>0) msg+=" | 外观异常="+sceneAppearanceErrors.Count;
             if(localizedScripts>0) msg+=" | 本地化脚本="+localizedScripts;
             if(localizationErrors.Count>0) msg+=" | 脚本本地化异常="+localizationErrors.Count;
             if(result.missing.Count>0) msg+=" | 缺失："+string.Join(", ",result.missing.ToArray());
             if(result.errors.Count>0) msg+=" | 错误："+string.Join("；",result.errors.ToArray());
             SetStatus(msg,true);
-            DebugLog("LoadPackageScene prep timings: autoDeleted="+autoDeleted+", rootDepsMs="+rootDepsSw.Elapsed.TotalMilliseconds.ToString("0")+", sceneReadMs="+sceneReadMs.ToString("0")+", timelineCacheHit="+timelineInfo.cacheHit+", timelineOptimized="+timelineInfo.optimized+", timelineReadMs="+timelineInfo.readMs.ToString("0")+", timelineOptimizeMs="+timelineInfo.optimizeMs.ToString("0")+", timelineCacheReadMs="+timelineInfo.cacheReadMs.ToString("0")+", timelineSourceBytes="+timelineInfo.sourceBytes+", timelineOutputBytes="+timelineInfo.outputBytes+", timelineAnimations="+timelineInfo.animations+", timelineCurves="+timelineInfo.curves+", timelineKeys="+timelineInfo.keyframes+", sceneRefsMs="+sceneRefsMs.ToString("0")+", sceneVariantMs="+sceneVariantMs.ToString("0")+", localizeMs="+localizeMs.ToString("0")+", linkMs="+linkSw.Elapsed.TotalMilliseconds.ToString("0")+", refreshMs="+refreshMs.ToString("0")+", totalMs="+totalSw.Elapsed.TotalMilliseconds.ToString("0")+", created="+result.created+", already="+result.already+", missing="+result.missing.Count+", errors="+result.errors.Count+", localizedScripts="+localizedScripts+", localizedScriptsChanged="+localizedScriptsChanged+", localizationErrors="+localizationErrors.Count+", mode="+SceneLoadModeName(sceneLoadMode)+", primary="+scenePrimaryPersonId+", deferred="+pendingDeferredAtomCount+", sceneLoadPath="+sceneLoadPath);
+            DebugLog("LoadPackageScene prep timings: autoDeleted="+autoDeleted+", rootDepsMs="+rootDepsSw.Elapsed.TotalMilliseconds.ToString("0")+", sceneReadMs="+sceneReadMs.ToString("0")+", sceneAppearanceMs="+sceneAppearanceMs.ToString("0")+", sceneAppearanceApplied="+sceneAppearanceApplied+", sceneAppearanceErrors="+sceneAppearanceErrors.Count+", timelineCacheHit="+timelineInfo.cacheHit+", timelineOptimized="+timelineInfo.optimized+", timelineReadMs="+timelineInfo.readMs.ToString("0")+", timelineOptimizeMs="+timelineInfo.optimizeMs.ToString("0")+", timelineCacheReadMs="+timelineInfo.cacheReadMs.ToString("0")+", timelineSourceBytes="+timelineInfo.sourceBytes+", timelineOutputBytes="+timelineInfo.outputBytes+", timelineAnimations="+timelineInfo.animations+", timelineCurves="+timelineInfo.curves+", timelineKeys="+timelineInfo.keyframes+", sceneRefsMs="+sceneRefsMs.ToString("0")+", sceneVariantMs="+sceneVariantMs.ToString("0")+", localizeMs="+localizeMs.ToString("0")+", linkMs="+linkSw.Elapsed.TotalMilliseconds.ToString("0")+", refreshMs="+refreshMs.ToString("0")+", totalMs="+totalSw.Elapsed.TotalMilliseconds.ToString("0")+", created="+result.created+", already="+result.already+", missing="+result.missing.Count+", errors="+result.errors.Count+", localizedScripts="+localizedScripts+", localizedScriptsChanged="+localizedScriptsChanged+", localizationErrors="+localizationErrors.Count+", mode="+SceneLoadModeName(sceneLoadMode)+", primary="+scenePrimaryPersonId+", deferred="+pendingDeferredAtomCount+", sceneLoadPath="+sceneLoadPath);
             int expectedAtoms = sceneVariant != null ? sceneVariant.keptAtoms
                 : (selectedSceneAnalysis != null && string.Equals(selectedSceneAnalysis.key, requestedSceneKey, StringComparison.OrdinalIgnoreCase) ? selectedSceneAnalysis.atoms.Count : 0);
             if(result.errors.Count==0 && SuperController.singleton!=null) {
@@ -7823,26 +8222,26 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
             SaveConfig();
             SetStatus("镜头模式：" + (v ? "开" : "关"), true);
         });
-        Text vrRotHint = MakeText(content.transform, "VrRotHint", "左移动摇杆按一下进入/退出。开启后：左右推杆=水平转向，前后推杆=升高/降低视角。", 12, TextAnchor.UpperLeft, colTextSecondary);
+        Text vrRotHint = MakeText(content.transform, "VrRotHint", "左移动摇杆按一下进入/退出。开启后：左右推杆=水平转向，前后推杆=以头显当前位置为中心前后翻转，可连续转过 180°。", 12, TextAnchor.UpperLeft, colTextSecondary);
         vrRotHint.horizontalOverflow = HorizontalWrapMode.Wrap;
         vrRotHint.verticalOverflow = VerticalWrapMode.Overflow;
-        SetFixedHeight(vrRotHint.gameObject, 48f);
+        SetFixedHeight(vrRotHint.gameObject, isVRMode ? 66f : 58f);
         Toggle vrInvTg = MakeToggle(content.transform, "反转左右转向", vrRotationInvert);
         SetFixedHeight(vrInvTg.gameObject, isVRMode ? 44f : 38f);
         vrInvTg.onValueChanged.AddListener((bool v) => { vrRotationInvert = v; SaveConfig(); SetStatus("左右转向反转：" + (v ? "开" : "关"), true); });
-        Toggle vrHInvTg = MakeToggle(content.transform, "反转升降方向", vrHeightInvert);
+        Toggle vrHInvTg = MakeToggle(content.transform, "反转前后翻转", vrPitchInvert);
         SetFixedHeight(vrHInvTg.gameObject, isVRMode ? 44f : 38f);
-        vrHInvTg.onValueChanged.AddListener((bool v) => { vrHeightInvert = v; SaveConfig(); SetStatus("升降反转：" + (v ? "开" : "关"), true); });
+        vrHInvTg.onValueChanged.AddListener((bool v) => { vrPitchInvert = v; SaveConfig(); SetStatus("前后翻转反转：" + (v ? "开" : "关"), true); });
         GameObject sensRow = CreateRow(content.transform, "VrSens", isVRMode ? 42f : 36f, 6, true);
         Button sensMinus = MakeButton(sensRow.transform, "转向慢", 13, colBtn); SetFlexibleItem(sensMinus.gameObject, 0f, 1f);
         sensMinus.onClick.AddListener(() => { vrRotationSensitivity = Mathf.Clamp(vrRotationSensitivity - 10f, 10f, 180f); SaveConfig(); SetStatus("转向灵敏度=" + vrRotationSensitivity.ToString("0") + "°/s", false); });
         Button sensPlus = MakeButton(sensRow.transform, "转向快", 13, colBtn); SetFlexibleItem(sensPlus.gameObject, 0f, 1f);
         sensPlus.onClick.AddListener(() => { vrRotationSensitivity = Mathf.Clamp(vrRotationSensitivity + 10f, 10f, 180f); SaveConfig(); SetStatus("转向灵敏度=" + vrRotationSensitivity.ToString("0") + "°/s", false); });
-        GameObject hRow = CreateRow(content.transform, "VrHeight", isVRMode ? 42f : 36f, 6, true);
-        Button hMinus = MakeButton(hRow.transform, "升降慢", 13, colBtn); SetFlexibleItem(hMinus.gameObject, 0f, 1f);
-        hMinus.onClick.AddListener(() => { vrHeightSpeed = Mathf.Clamp(vrHeightSpeed - 0.15f, 0.10f, 3.00f); SaveConfig(); SetStatus("升降速度=" + vrHeightSpeed.ToString("0.00") + " m/s", false); });
-        Button hPlus = MakeButton(hRow.transform, "升降快", 13, colBtn); SetFlexibleItem(hPlus.gameObject, 0f, 1f);
-        hPlus.onClick.AddListener(() => { vrHeightSpeed = Mathf.Clamp(vrHeightSpeed + 0.15f, 0.10f, 3.00f); SaveConfig(); SetStatus("升降速度=" + vrHeightSpeed.ToString("0.00") + " m/s", false); });
+        GameObject hRow = CreateRow(content.transform, "VrPitch", isVRMode ? 42f : 36f, 6, true);
+        Button hMinus = MakeButton(hRow.transform, "翻转慢", 13, colBtn); SetFlexibleItem(hMinus.gameObject, 0f, 1f);
+        hMinus.onClick.AddListener(() => { vrPitchSensitivity = Mathf.Clamp(vrPitchSensitivity - 10f, 10f, 180f); SaveConfig(); SetStatus("翻转灵敏度=" + vrPitchSensitivity.ToString("0") + "°/s", false); });
+        Button hPlus = MakeButton(hRow.transform, "翻转快", 13, colBtn); SetFlexibleItem(hPlus.gameObject, 0f, 1f);
+        hPlus.onClick.AddListener(() => { vrPitchSensitivity = Mathf.Clamp(vrPitchSensitivity + 10f, 10f, 180f); SaveConfig(); SetStatus("翻转灵敏度=" + vrPitchSensitivity.ToString("0") + "°/s", false); });
         GameObject snapRow = CreateRow(content.transform, "VrSnap", isVRMode ? 42f : 36f, 6, true);
         Button snapCont = MakeButton(snapRow.transform, "连续转向", 12, colBtn); SetFlexibleItem(snapCont.gameObject, 0f, 1f);
         snapCont.onClick.AddListener(() => { vrRotationSnapAngle = 0f; SaveConfig(); SetStatus("镜头转向：连续", false); });
@@ -8008,6 +8407,7 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         SetGoActive(presetModeRoot, false); // 快捷模式已移除
         SetGoActive(sceneModeRoot, isScene);
         SetGoActive(scenePersonRoot, isScene && selectedSceneAnalysis != null && selectedSceneAnalysis.personIds.Count > 0);
+        SetGoActive(sceneAppearanceRoot, isScene && selectedSceneAnalysis != null && selectedSceneAnalysis.femalePersonIds.Count > 0);
         bool canLoadScene = isScene || (selected != null && selected.firstScene != "" && activeCat == "Scenes" && selectedSceneItem == null);
         bool hasDeferredScene = !string.IsNullOrEmpty(pendingDeferredScenePath) && pendingDeferredAtomCount > 0;
         SetGoActive(sceneActionRoot, canLoadScene || hasDeferredScene);
