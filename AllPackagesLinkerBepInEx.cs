@@ -21,9 +21,9 @@ using MVR.FileManagement;
 using Valve.VR;
 using HarmonyLib;
 
-[BepInPlugin("local.vam.allpackageslinker", "AllPackagesLinker", "1.4.4")]
+[BepInPlugin("local.vam.allpackageslinker", "AllPackagesLinker", "1.4.6")]
 public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
-    private const string PluginVersion = "1.4.4";
+    private const string PluginVersion = "1.4.6";
     private const string TimelineConverterVersion = "timeline-optimized-v1";
     private const long MaxLargeSceneTextBytes = 1024L * 1024L * 1024L;
     private const string LinkRootName = "_AllPackagesLinkerLinks";
@@ -172,6 +172,11 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         public List<string> missing = new List<string>();
         public List<string> errors = new List<string>();
     }
+    private class DeferredThumbnailGroup {
+        public ImageLoaderThreaded loader;
+        public bool immediate;
+        public List<ImageLoaderThreaded.QueuedImage> requests = new List<ImageLoaderThreaded.QueuedImage>();
+    }
     private delegate void UiAction();
 
     private string vamRoot, allRoot, addonRoot, linkRoot, dataRoot, thumbRoot, indexPath, configPath, favoritesPath, favoriteUidsPath, defaultsPath, logPath, debugLogPath;
@@ -287,7 +292,13 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
     private Harmony textureFinishHarmony = null;
     private static AllPackagesLinkerBepInEx textureFinishOwner = null;
     private static bool textureFinishPatchApplied = false;
+    private static bool thumbnailQueuePatchApplied = false;
     private static int textureFinishTranspilerHits = 0;
+    private readonly object deferredThumbnailLock = new object();
+    private Dictionary<string, DeferredThumbnailGroup> deferredThumbnailGroups = new Dictionary<string, DeferredThumbnailGroup>(StringComparer.OrdinalIgnoreCase);
+    private Coroutine deferredThumbnailFlushCoroutine = null;
+    private int sceneLoadDeferredThumbnailRequests = 0;
+    private int sceneLoadDeferredThumbnailDuplicates = 0;
     private Harmony assetCallbackHarmony = null;
     private static AllPackagesLinkerBepInEx assetCallbackOwner = null;
     private static bool assetCallbackPatchApplied = false;
@@ -786,22 +797,35 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
     private void InstallTextureFinishPatch() {
         textureFinishOwner = this;
         textureFinishPatchApplied = false;
+        thumbnailQueuePatchApplied = false;
         textureFinishTranspilerHits = 0;
         try {
             MethodInfo target = AccessTools.Method(typeof(ImageLoaderThreaded), "PostProcessCompletedImages");
             MethodInfo transpiler = AccessTools.Method(typeof(AllPackagesLinkerBepInEx), "TextureFinishTranspiler");
-            if (object.ReferenceEquals(target, null) || object.ReferenceEquals(transpiler, null)) throw new MissingMethodException("ImageLoaderThreaded.PostProcessCompletedImages or transpiler not found");
+            MethodInfo queueThumbnail = AccessTools.Method(typeof(ImageLoaderThreaded), "QueueThumbnail", new Type[] { typeof(ImageLoaderThreaded.QueuedImage) });
+            MethodInfo queueThumbnailImmediate = AccessTools.Method(typeof(ImageLoaderThreaded), "QueueThumbnailImmediate", new Type[] { typeof(ImageLoaderThreaded.QueuedImage) });
+            MethodInfo thumbnailPrefix = AccessTools.Method(typeof(AllPackagesLinkerBepInEx), "ThumbnailQueuePrefix");
+            MethodInfo thumbnailImmediatePrefix = AccessTools.Method(typeof(AllPackagesLinkerBepInEx), "ThumbnailQueueImmediatePrefix");
+            if (object.ReferenceEquals(target, null) || object.ReferenceEquals(transpiler, null)
+                || object.ReferenceEquals(queueThumbnail, null) || object.ReferenceEquals(queueThumbnailImmediate, null)
+                || object.ReferenceEquals(thumbnailPrefix, null) || object.ReferenceEquals(thumbnailImmediatePrefix, null)) {
+                throw new MissingMethodException("ImageLoaderThreaded texture finish or thumbnail queue members not found");
+            }
             textureFinishHarmony = new Harmony(TextureFinishHarmonyId);
             textureFinishHarmony.Patch(target, null, null, new HarmonyMethod(transpiler));
+            textureFinishHarmony.Patch(queueThumbnail, new HarmonyMethod(thumbnailPrefix), null, null);
+            textureFinishHarmony.Patch(queueThumbnailImmediate, new HarmonyMethod(thumbnailImmediatePrefix), null, null);
             if (textureFinishTranspilerHits != 1) {
                 throw new InvalidOperationException("expected one texture finish loop limit, matched " + textureFinishTranspilerHits);
             }
             textureFinishPatchApplied = true;
-            DebugLog("Texture finish patch installed. gear=" + TextureFinishGearName(textureFinishGear) + ", loadingLimit=" + TextureFinishLimitForGear(textureFinishGear) + ", idleLimit=" + TextureFinishVanillaLimit);
+            thumbnailQueuePatchApplied = true;
+            DebugLog("Texture finish patch installed. gear=" + TextureFinishGearName(textureFinishGear) + ", loadingLimit=" + TextureFinishLimitForGear(textureFinishGear) + ", idleLimit=" + TextureFinishVanillaLimit + ", deferSceneThumbnails=True");
         } catch(Exception e) {
             try { if (textureFinishHarmony != null) textureFinishHarmony.UnpatchAll(TextureFinishHarmonyId); } catch {}
             textureFinishHarmony = null;
             textureFinishPatchApplied = false;
+            thumbnailQueuePatchApplied = false;
             Logger.LogWarning("Texture finish acceleration disabled; vanilla limit remains active: " + e.Message);
             DebugLog("Texture finish patch failed: " + e.ToString());
         }
@@ -812,7 +836,140 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         catch(Exception e) { Logger.LogWarning("Texture finish patch cleanup failed: " + e.Message); }
         textureFinishHarmony = null;
         textureFinishPatchApplied = false;
+        thumbnailQueuePatchApplied = false;
+        DiscardDeferredSceneThumbnails();
         if (object.ReferenceEquals(textureFinishOwner, this)) textureFinishOwner = null;
+    }
+
+    private static bool ThumbnailQueuePrefix(ImageLoaderThreaded __instance, ImageLoaderThreaded.QueuedImage __0) {
+        return ShouldRunOriginalThumbnailQueue(__instance, __0, false);
+    }
+
+    private static bool ThumbnailQueueImmediatePrefix(ImageLoaderThreaded __instance, ImageLoaderThreaded.QueuedImage __0) {
+        return ShouldRunOriginalThumbnailQueue(__instance, __0, true);
+    }
+
+    private static bool ShouldRunOriginalThumbnailQueue(ImageLoaderThreaded loader, ImageLoaderThreaded.QueuedImage request, bool immediate) {
+        AllPackagesLinkerBepInEx owner = textureFinishOwner;
+        if (!thumbnailQueuePatchApplied || owner == null || loader == null || request == null) return true;
+        return !owner.TryDeferSceneThumbnail(loader, request, immediate);
+    }
+
+    private bool TryDeferSceneThumbnail(ImageLoaderThreaded loader, ImageLoaderThreaded.QueuedImage request, bool immediate) {
+        if (!sceneLoadProfileActive || loader == null || request == null) return false;
+        request.isThumbnail = true;
+        Monitor.Enter(deferredThumbnailLock);
+        try {
+            string signature = request.cacheSignature;
+            if (request.skipCache || request.forceReload || string.IsNullOrEmpty(signature)) {
+                signature = "uncached:" + sceneLoadDeferredThumbnailRequests.ToString(CultureInfo.InvariantCulture);
+            } else {
+                signature += "|loader=" + loader.GetInstanceID().ToString(CultureInfo.InvariantCulture);
+            }
+            DeferredThumbnailGroup group;
+            if (!deferredThumbnailGroups.TryGetValue(signature, out group)) {
+                group = new DeferredThumbnailGroup();
+                group.loader = loader;
+                group.immediate = immediate;
+                deferredThumbnailGroups[signature] = group;
+            } else {
+                group.immediate |= immediate;
+            }
+            if (group.requests.Contains(request)) return true;
+            if (group.requests.Count > 0) sceneLoadDeferredThumbnailDuplicates++;
+            group.requests.Add(request);
+            sceneLoadDeferredThumbnailRequests++;
+        } finally {
+            Monitor.Exit(deferredThumbnailLock);
+        }
+        return true;
+    }
+
+    private IEnumerator FlushDeferredSceneThumbnailsWhenIdle() {
+        while (SuperController.singleton != null && SuperController.singleton.isLoading) yield return null;
+        yield return null;
+        deferredThumbnailFlushCoroutine = null;
+        FlushDeferredSceneThumbnails();
+    }
+
+    private void ScheduleDeferredSceneThumbnailFlush() {
+        if (deferredThumbnailFlushCoroutine != null) return;
+        bool hasGroups;
+        Monitor.Enter(deferredThumbnailLock);
+        try {
+            hasGroups = deferredThumbnailGroups.Count > 0;
+        } finally {
+            Monitor.Exit(deferredThumbnailLock);
+        }
+        if (!hasGroups) return;
+        deferredThumbnailFlushCoroutine = StartCoroutine(FlushDeferredSceneThumbnailsWhenIdle());
+    }
+
+    private void FlushDeferredSceneThumbnails() {
+        List<DeferredThumbnailGroup> groups;
+        int requestCount;
+        int duplicateCount;
+        Monitor.Enter(deferredThumbnailLock);
+        try {
+            groups = new List<DeferredThumbnailGroup>(deferredThumbnailGroups.Values);
+            deferredThumbnailGroups.Clear();
+            requestCount = sceneLoadDeferredThumbnailRequests;
+            duplicateCount = sceneLoadDeferredThumbnailDuplicates;
+        } finally {
+            Monitor.Exit(deferredThumbnailLock);
+        }
+        int queued = 0;
+        int canceled = 0;
+        for (int i = 0; i < groups.Count; i++) {
+            DeferredThumbnailGroup group = groups[i];
+            if (group == null || group.loader == null || group.requests.Count == 0) continue;
+            ImageLoaderThreaded.QueuedImage primary = null;
+            List<ImageLoaderThreaded.QueuedImage> followers = new List<ImageLoaderThreaded.QueuedImage>();
+            for (int r = 0; r < group.requests.Count; r++) {
+                ImageLoaderThreaded.QueuedImage request = group.requests[r];
+                if (request == null || request.cancel) { canceled++; continue; }
+                if (primary == null) primary = request; else followers.Add(request);
+            }
+            if (primary == null) continue;
+            ImageLoaderThreaded.ImageLoaderCallback originalCallback = primary.callback;
+            primary.callback = delegate(ImageLoaderThreaded.QueuedImage loaded) {
+                if (originalCallback != null) {
+                    try { originalCallback(loaded); } catch (Exception e) { DebugLog("Deferred thumbnail primary callback failed: " + e.Message); }
+                }
+                for (int f = 0; f < followers.Count; f++) {
+                    ImageLoaderThreaded.QueuedImage follower = followers[f];
+                    if (follower == null || follower.cancel) continue;
+                    follower.tex = loaded == null ? null : loaded.tex;
+                    follower.hadError = loaded == null || loaded.hadError;
+                    follower.errorText = loaded == null ? "deferred thumbnail primary was null" : loaded.errorText;
+                    follower.processed = true;
+                    follower.finished = true;
+                    try { follower.DoCallback(); } catch (Exception e) { DebugLog("Deferred thumbnail follower callback failed: " + e.Message); }
+                }
+            };
+            if (group.immediate) group.loader.QueueThumbnailImmediate(primary); else group.loader.QueueThumbnail(primary);
+            queued++;
+        }
+        DebugLog("Deferred scene thumbnails flushed. requests=" + requestCount + ", uniqueQueued=" + queued + ", duplicates=" + duplicateCount + ", canceled=" + canceled);
+    }
+
+    private void DiscardDeferredSceneThumbnails() {
+        if (deferredThumbnailFlushCoroutine != null) {
+            try { StopCoroutine(deferredThumbnailFlushCoroutine); } catch {}
+            deferredThumbnailFlushCoroutine = null;
+        }
+        Monitor.Enter(deferredThumbnailLock);
+        try {
+            foreach (DeferredThumbnailGroup group in deferredThumbnailGroups.Values) {
+                if (group == null) continue;
+                for (int i = 0; i < group.requests.Count; i++) if (group.requests[i] != null) group.requests[i].cancel = true;
+            }
+            deferredThumbnailGroups.Clear();
+            sceneLoadDeferredThumbnailRequests = 0;
+            sceneLoadDeferredThumbnailDuplicates = 0;
+        } finally {
+            Monitor.Exit(deferredThumbnailLock);
+        }
     }
 
     private static IEnumerable<CodeInstruction> TextureFinishTranspiler(IEnumerable<CodeInstruction> instructions) {
@@ -1989,6 +2146,15 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
         return false;
     }
 
+    private bool TryResolveSceneScriptPackage(PackageLite scenePackage, string uid, out PackageLite scriptPackage, out string source) {
+        if (string.Equals(uid, "SELF", StringComparison.OrdinalIgnoreCase)) {
+            scriptPackage = scenePackage;
+            source = "scene-self";
+            return scriptPackage != null;
+        }
+        return TryResolvePackageByUid(uid, out scriptPackage, out source);
+    }
+
     private string MaterializeSceneWithLocalScripts(PackageLite scenePackage, string sceneEntry, string sceneJson, out int replaced, out List<string> errors, out bool scriptsChanged) {
         replaced = 0;
         scriptsChanged = false;
@@ -2011,7 +2177,7 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
             string source;
             if (!resolvedScriptPackages.TryGetValue(occurrence.uid, out scriptPackage)) {
                 if (missingScriptPackages.Contains(occurrence.uid)) continue;
-                if (!TryResolvePackageByUid(occurrence.uid, out scriptPackage, out source)) {
+                if (!TryResolveSceneScriptPackage(scenePackage, occurrence.uid, out scriptPackage, out source)) {
                     missingScriptPackages.Add(occurrence.uid);
                     errors.Add("脚本包未找到：" + occurrence.uid);
                     continue;
@@ -2074,7 +2240,8 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
             string scriptSuffix = end > markerAt + marker.Length ? sceneJson.Substring(markerAt + marker.Length, end - markerAt - marker.Length).Trim() : "";
             int dots = 0;
             for (int d = 0; d < uid.Length; d++) if (uid[d] == '.') dots++;
-            if (dots >= 2 && uid.Length > 0 && scriptSuffix.Length > 0) {
+            bool isSelf = string.Equals(uid, "SELF", StringComparison.OrdinalIgnoreCase);
+            if ((dots >= 2 || isSelf) && uid.Length > 0 && scriptSuffix.Length > 0) {
                 SceneScriptRefOccurrence occurrence = new SceneScriptRefOccurrence();
                 occurrence.start = start;
                 occurrence.length = end - start;
@@ -6548,19 +6715,17 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
             lastLoadClickAt=Time.realtimeSinceStartup;
             if(p==null||scene==""){SetStatus("没有可加载的场景。",true);return;}
             CancelPendingSceneLoad();
+            // The VaM core P24 path already preloads scene textures. Cancel APL's
+            // selection-time queue so it cannot race the same files during Person creation.
+            StopScenePrewarm(true);
             lazyCuaCandidateAtomUids.Clear();
             string requestedSceneKey = SceneAnalysisKey(p, scene);
             DebugLog("LoadPackageScene begin. uid="+p.uid+", scene="+scene+", mode="+SceneLoadModeName(sceneLoadMode)+", primary="+scenePrimaryPersonId);
             selected=p;
             if (selectedSceneItem == null || selectedSceneItem.package != p || !string.Equals(selectedSceneItem.entryPath, scene, StringComparison.OrdinalIgnoreCase)) SelectPackage(p);
             ClearPendingDeferredScene();
-            if (scenePrewarmCoroutine != null) {
-                try { StopCoroutine(scenePrewarmCoroutine); } catch {}
-                scenePrewarmCoroutine = null;
-            }
             int autoDeleted = 0;
             if(autoCleanLinksBeforeSceneLoad){
-                StopScenePrewarm(true);
                 autoDeleted = ClearGeneratedLinksForSceneLoad();
                 if(autoDeleted > 0) ScanAddonLightweight();
             }
@@ -6777,6 +6942,15 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
     }
     private void BeginSceneLoadProfile(string scenePath, int expectedAtoms) {
         if (sceneLoadProfileActive) FinishSceneLoadProfile("replaced-by-new-load");
+        Monitor.Enter(deferredThumbnailLock);
+        try {
+            if (deferredThumbnailGroups.Count == 0) {
+                sceneLoadDeferredThumbnailRequests = 0;
+                sceneLoadDeferredThumbnailDuplicates = 0;
+            }
+        } finally {
+            Monitor.Exit(deferredThumbnailLock);
+        }
         sceneLoadProfileActive = true;
         sceneLoadProfileSeenLoading = false;
         sceneLoadProfileLastLoading = false;
@@ -7003,6 +7177,10 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
     private void FinishSceneLoadProfile(string reason) {
         if (!sceneLoadProfileActive) return;
         float now = Time.realtimeSinceStartup;
+        int deferredThumbnailGroupCount;
+        Monitor.Enter(deferredThumbnailLock);
+        try { deferredThumbnailGroupCount = deferredThumbnailGroups.Count; }
+        finally { Monitor.Exit(deferredThumbnailLock); }
         DebugLog("[SceneLoadProfile] complete reason=" + reason
             + ", elapsedMs=" + SceneLoadProfileElapsedMs(now).ToString("0")
             + ", loadingSeen=" + sceneLoadProfileSeenLoading
@@ -7025,8 +7203,12 @@ public partial class AllPackagesLinkerBepInEx : BaseUnityPlugin {
             + ", callbackWorkMs=" + sceneLoadProfileAssetCallbackWorkMs.ToString("0")
             + ", slowestCallbackMs=" + sceneLoadProfileSlowestAssetCallbackMs.ToString("0")
             + ", slowestCallback=" + (string.IsNullOrEmpty(sceneLoadProfileSlowestAssetCallback) ? "-" : sceneLoadProfileSlowestAssetCallback)
+            + ", deferredThumbRequests=" + sceneLoadDeferredThumbnailRequests
+            + ", deferredThumbUnique=" + deferredThumbnailGroupCount
+            + ", deferredThumbDuplicates=" + sceneLoadDeferredThumbnailDuplicates
             + ", path=" + sceneLoadProfilePath);
         sceneLoadProfileActive = false;
+        ScheduleDeferredSceneThumbnailFlush();
         sceneLoadProfileAtoms.Clear();
         sceneLoadProfilePendingHolds.Clear();
         sceneLoadProfileHoldFirstSeen.Clear();
